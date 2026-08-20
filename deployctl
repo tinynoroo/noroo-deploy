@@ -1267,6 +1267,56 @@ def put_env(name, key, value):
     return True
 
 
+# ── init 되돌리기 ───────────────────────────────────────────────────────
+#
+# 배포할 수 있는 형태가 아니면 아무것도 만들지 않고 끝낸다. 그 뒤 단계에서
+# 실패하면 이번 실행이 만든 서버 상태를 되돌린다. 소스와 초안 파일은 남긴다.
+
+def compose_in(name, app, checkout):
+    ref = app.get("composeFile", "source:compose.yaml")
+    if ref.startswith("source:"):
+        return Path(checkout) / ref.split(":", 1)[1]
+    return site_dir(name) / ref
+
+
+def missing_build_files(name, app, checkout):
+    compose = compose_in(name, app, checkout)
+    return [p.name for p in (Path(checkout) / "Dockerfile", compose) if not p.exists()]
+
+
+def drop_db(name):
+    db, user = db_names(name)
+    psql("DROP DATABASE IF EXISTS {d};\nDROP ROLE IF EXISTS {u};".format(d=db, u=user))
+
+
+def teardown(name, app, checkout):
+    """이번 실행이 띄운 컨테이너와 등록한 Caddy 사이트를 걷어낸다."""
+    try:
+        run(compose_args(name, app, str(checkout) if checkout else None) + ["down"],
+            capture=False, check=False)
+    except DeployError:
+        pass
+    site = CADDY_SITES / ("%s.caddy" % app["domain"])
+    if site.exists():
+        site.unlink()
+        try:
+            caddy_reload()
+        except DeployError:
+            pass
+
+
+def run_undo(undo):
+    if not undo:
+        return
+    print("\n[되돌리기] 이번 실행이 만든 것을 지웁니다")
+    for label, action in reversed(undo):
+        try:
+            action()
+            print("  %s 지움" % label)
+        except Exception as exc:
+            print("  %s 지우기 실패 — 직접 확인하세요: %s" % (label, exc))
+
+
 # ── 명령 ────────────────────────────────────────────────────────────────
 
 def cmd_init(args):
@@ -1307,17 +1357,11 @@ def cmd_init(args):
     }
     if args.max_upload:
         app["maxUploadMB"] = args.max_upload
-    write_atomic(manifest_path(name), json.dumps(app, indent=2, ensure_ascii=False) + "\n")
-    print("매니페스트: %s" % manifest_path(name))
-    print("  도메인 %s · 포트 %d · 풀 %d" % (app["domain"], app["port"], app["poolSize"]))
 
+    # ── 배포할 수 있는 형태인지 먼저 본다. 아니면 아무것도 만들지 않고 끝낸다.
     checkout = None if args.no_clone else clone_repo(name, app["repository"])
-
     if checkout:
-        ref = app.get("composeFile", "source:compose.yaml")
-        compose_path = (checkout / ref.split(":", 1)[1] if ref.startswith("source:")
-                        else site_dir(name) / ref)
-        missing = [p.name for p in (checkout / "Dockerfile", compose_path) if not p.exists()]
+        missing = missing_build_files(name, app, checkout)
         if missing:
             print("  없는 파일: %s" % ", ".join(missing))
             wanted = args.scaffold
@@ -1329,6 +1373,31 @@ def cmd_init(args):
                     scaffold(name, app, checkout)
                 except DeployError as exc:
                     print("  스캐폴딩 실패: %s" % exc)
+            missing = missing_build_files(name, app, checkout)
+        if missing:
+            raise DeployError(
+                "배포할 수 있는 형태가 아닙니다 — %s 가 없습니다.\n"
+                "  매니페스트도 DB도 러너도 Caddy 등록도 만들지 않았습니다.\n"
+                "  파일을 갖춘 뒤 다시 실행하세요." % ", ".join(missing))
+
+    undo = []
+    try:
+        return init_steps(args, app, checkout, undo)
+    except DeployError:
+        run_undo(undo)
+        if checkout:
+            print("  소스는 남깁니다: %s" % checkout)
+        raise
+
+
+def init_steps(args, app, checkout, undo):
+    name = app["name"]
+    fresh_dir = not site_dir(name).exists()
+    write_atomic(manifest_path(name), json.dumps(app, indent=2, ensure_ascii=False) + "\n")
+    if fresh_dir:
+        undo.append(("매니페스트 %s" % site_dir(name), lambda: shutil.rmtree(site_dir(name))))
+    print("매니페스트: %s" % manifest_path(name))
+    print("  도메인 %s · 포트 %d · 풀 %d" % (app["domain"], app["port"], app["poolSize"]))
 
     if checkout:
         write_workflow(name, checkout)
@@ -1337,15 +1406,22 @@ def cmd_init(args):
 
     runner_path = None
     if args.runner:
+        fresh_runner = not (runner_dir(name) / ".runner").exists()
         try:
             runner_path = runner_install(name, app)
+            if fresh_runner:
+                undo.append(("러너 mac-%s" % name, lambda: runner_remove(name, app)))
         except DeployError as exc:
             print("  러너 등록 실패: %s" % exc)
             print("  나중에 다시: deployctl runner %s" % name)
 
     env_file = site_dir(name) / ".env"
     if args.db:
+        db, _ = db_names(name)
+        fresh_db = not psql("SELECT 1 FROM pg_database WHERE datname='%s';" % db, quiet=True)
         url = provision_db(name, app)
+        if fresh_db:
+            undo.append(("DB %s" % db, lambda: drop_db(name)))
         if url:
             full = "%s?connection_limit=%d" % (url, app["poolSize"])
             if put_env(name, "DATABASE_URL", full):
@@ -1358,16 +1434,17 @@ def cmd_init(args):
 
     if args.deploy and checkout:
         print()
-        local_ok = True
+        undo.append(("컨테이너·Caddy 등록", lambda: teardown(name, app, checkout)))
         if runner_path and args.push is not False:
             print("[배포] push 해서 러너가 하게 합니다")
             done, may_fallback = deploy_by_push(name, app, checkout)
             if done:
+                undo.clear()
                 print("\n배포 완료: https://%s%s" % (app["domain"], app.get("healthPath", "/")))
                 print("이제 %s 에 push할 때마다 자동 배포됩니다." % default_branch(checkout))
                 return 0
             if not may_fallback:
-                return 1
+                raise DeployError("러너에서 배포가 실패했습니다.")
             print("  로컬 배포로 물러섭니다")
         elif runner_path:
             print("[배포] 여기서 합니다 (--no-push)")
@@ -1376,22 +1453,22 @@ def cmd_init(args):
 
         rc = cmd_deploy(argparse.Namespace(name=name, source=str(checkout), no_build=False,
                                            timeout=180, quiet=False, no_rollback=False))
-        if rc == 0:
-            print("\n배포 완료: https://%s%s" % (app["domain"], app.get("healthPath", "/")))
-            print("자동 배포는 아직입니다. 검수한 뒤 미세요:")
-            print("  cd %s && git add -A && git commit && git push" % checkout)
-        return rc
+        if rc != 0:
+            raise DeployError("배포가 실패했습니다.")
+        undo.clear()
+        print("\n배포 완료: https://%s%s" % (app["domain"], app.get("healthPath", "/")))
+        print("자동 배포는 아직입니다. 검수한 뒤 미세요:")
+        print("  cd %s && git add -A && git commit && git push" % checkout)
+        return 0
 
+    undo.clear()
     print("\n다음 순서")
     steps = []
     if not checkout:
         steps.append("소스를 받습니다: %s"
                      % " ".join(clone_cmd(app["repository"], WORKSPACES / name)))
-    compose_ref = app.get("composeFile", "")
-    compose_hint = (WORKSPACES / name / compose_ref.split(":", 1)[1]
-                    if compose_ref.startswith("source:") else site_dir(name) / compose_ref)
     steps.append("%s 의 ports 를 \"127.0.0.1:%d:<컨테이너포트>\" 로 맞춥니다."
-                 % (compose_hint, app["port"]))
+                 % (compose_in(name, app, checkout or WORKSPACES / name), app["port"]))
     steps.append("앱이 쓸 나머지 시크릿을 %s 에 넣습니다." % env_file)
     if not runner_path:
         steps.append("러너를 붙입니다: deployctl runner %s" % name)
