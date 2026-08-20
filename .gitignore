@@ -1,0 +1,10 @@
+# deployctl이 남기는 백업
+*.backup.*
+*.removed.*
+
+# 사이트 비밀값은 ~/srv 에만 둔다. 여기 들어오면 안 된다.
+.env
+*.env
+
+# Claude Code 로컬 설정 (머신별)
+.claude/settings.local.json

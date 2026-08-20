@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""deployctl — Mac mini 다중 사이트 호스팅 서버의 배포 도구.
+
+CLAUDE.md의 규칙을 사람이 외우는 대신 기계가 검사하고 수행한다.
+사이트 하나를 올리는 데 필요한 일곱 가지를 담당한다.
+
+    포트 배정 · DB 프로비저닝 · 컨테이너 기동 · Caddy 사이트 등록 · 인증서 · 검증 · 정리
+
+전제: 공유 Postgres(`~/srv/postgres`)와 Caddy가 이미 떠 있어야 한다.
+sudo는 쓰지 않는다. Caddy reload는 관리 API(127.0.0.1:2019)로 한다.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+SRV = Path.home() / "srv"
+CADDYFILE = Path("/opt/homebrew/etc/Caddyfile")
+CADDY_SITES = CADDYFILE.parent / "caddy-sites"
+CADDY_ADMIN = "http://127.0.0.1:2019"
+PG_CONTAINER = "postgres"
+DBNET = "dbnet"
+# 규칙 4-3. 사이트당 커넥션 상한. 예외는 app.json의 poolSize로 명시한다.
+DEFAULT_POOL = 5
+PORT_RANGE = range(9000, 9100)
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+class DeployError(Exception):
+    """사용자에게 그대로 보여줄 오류. 트레이스백을 찍지 않는다."""
+
+
+# ── 셸 ──────────────────────────────────────────────────────────────────
+
+def run(cmd, capture=True, check=True, cwd=None, env=None):
+    merged = {**os.environ, **(env or {})}
+    p = subprocess.run(cmd, capture_output=capture, text=True, cwd=cwd, env=merged)
+    if check and p.returncode != 0:
+        detail = (p.stderr or p.stdout or "").strip() if capture else ""
+        raise DeployError("명령 실패: %s\n%s" % (" ".join(cmd), detail[-2000:]))
+    return (p.stdout or "").strip() if capture else ""
+
+
+def psql(sql, db="postgres", user="postgres", quiet=False):
+    """공유 Postgres에 superuser로 SQL을 넣는다."""
+    cmd = ["docker", "exec", "-i", PG_CONTAINER, "psql", "-v", "ON_ERROR_STOP=1",
+           "-U", user, "-d", db]
+    if quiet:
+        cmd += ["-tA"]
+    p = subprocess.run(cmd, input=sql, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise DeployError("psql 실패:\n%s" % (p.stderr or p.stdout).strip())
+    return p.stdout.strip()
+
+
+# ── 매니페스트 ──────────────────────────────────────────────────────────
+
+def site_dir(name):
+    return SRV / name
+
+
+def manifest_path(name):
+    return site_dir(name) / "app.json"
+
+
+def load(name):
+    path = manifest_path(name)
+    if not path.exists():
+        raise DeployError("사이트를 찾을 수 없습니다: %s (%s 없음)" % (name, path))
+    return json.loads(path.read_text())
+
+
+def all_sites():
+    """등록된 사이트를 모두 읽는다. 포트·도메인 중복 검사의 기준이 된다."""
+    out = {}
+    if not SRV.exists():
+        return out
+    for path in sorted(SRV.glob("*/app.json")):
+        try:
+            out[path.parent.name] = json.loads(path.read_text())
+        except ValueError:
+            raise DeployError("매니페스트가 깨졌습니다: %s" % path)
+    return out
+
+
+def write_atomic(path, text, mode=0o644):
+    """덮어쓰기 전 백업을 남기고 임시 파일로 원자적 교체한다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_text() == text:
+            return False
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(path, path.with_name("%s.backup.%s" % (path.name, stamp)))
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent))
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    return True
+
+
+# ── 포트 ────────────────────────────────────────────────────────────────
+
+def port_in_use(port):
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
+
+
+def allocate_port(taken):
+    for port in PORT_RANGE:
+        if port not in taken and not port_in_use(port):
+            return port
+    raise DeployError("빈 포트가 없습니다 (%d-%d)" % (PORT_RANGE.start, PORT_RANGE.stop - 1))
+
+
+# ── Caddy ───────────────────────────────────────────────────────────────
+
+SITE_TEMPLATE = """\
+# deployctl이 생성한다. 직접 고치지 말고 app.json을 고친 뒤 deployctl deploy 를 쓴다.
+{domain} {{
+	encode zstd gzip
+{body}
+	reverse_proxy 127.0.0.1:{port} {{
+		transport http {{
+			read_timeout {timeout}s
+			write_timeout {timeout}s
+		}}
+	}}
+
+	header {{
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "same-origin"
+		-Server
+	}}
+
+	log {{
+		output file /opt/homebrew/var/log/caddy/{domain}.log {{
+			roll_size 50MiB
+			roll_keep 10
+		}}
+		format json
+	}}
+}}
+"""
+
+
+def ensure_caddy_import():
+    """메인 Caddyfile이 사이트 디렉터리를 import 하도록 한다."""
+    CADDY_SITES.mkdir(parents=True, exist_ok=True)
+    Path("/opt/homebrew/var/log/caddy").mkdir(parents=True, exist_ok=True)
+    text = CADDYFILE.read_text() if CADDYFILE.exists() else "{\n}\n"
+    if "import caddy-sites/*.caddy" in text:
+        return
+    text = text.rstrip() + "\n\n# 사이트별 설정. deployctl이 파일 단위로 넣고 뺀다.\nimport caddy-sites/*.caddy\n"
+    write_atomic(CADDYFILE, text)
+
+
+def detach_inline_site(domain):
+    """메인 Caddyfile에 손으로 적어 둔 같은 도메인 블록을 걷어낸다.
+
+    사이트 파일과 인라인 블록이 함께 있으면 Caddy가 ambiguous site definition으로 거부한다.
+    deployctl이 그 도메인을 맡는 시점에 한 번 옮겨 온다. 원본은 백업된다.
+    """
+    if not CADDYFILE.exists():
+        return False
+    lines = CADDYFILE.read_text().split("\n")
+    pattern = re.compile(r"(^|[\s,])%s([\s,{]|$)" % re.escape(domain))
+    out, i, removed = [], 0, False
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.endswith("{") and not stripped.startswith("#") and pattern.search(stripped):
+            depth = 0
+            while i < len(lines):
+                depth += lines[i].count("{") - lines[i].count("}")
+                i += 1
+                if depth <= 0:
+                    break
+            removed = True
+            continue
+        out.append(line)
+        i += 1
+    if not removed:
+        return False
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).rstrip() + "\n"
+    write_atomic(CADDYFILE, text)
+    return True
+
+
+def write_site(app):
+    ensure_caddy_import()
+    if detach_inline_site(app["domain"]):
+        print("     메인 Caddyfile의 %s 인라인 블록을 사이트 파일로 넘겼습니다 (백업 있음)" % app["domain"])
+    body = ""
+    if app.get("maxUploadMB"):
+        body = "\n\trequest_body {\n\t\tmax_size %dMB\n\t}\n" % app["maxUploadMB"]
+    text = SITE_TEMPLATE.format(domain=app["domain"], port=app["port"],
+                                timeout=app.get("proxyTimeout", 310), body=body)
+    return write_atomic(CADDY_SITES / ("%s.caddy" % app["domain"]), text)
+
+
+def caddy_reload():
+    """관리 API로 무중단 반영. sudo가 필요 없다."""
+    run(["caddy", "validate", "--config", str(CADDYFILE)])
+    run(["caddy", "reload", "--config", str(CADDYFILE)])
+
+
+def caddy_hosts():
+    try:
+        with urllib.request.urlopen("%s/config/apps/http/servers" % CADDY_ADMIN, timeout=5) as r:
+            servers = json.load(r) or {}
+    except Exception:
+        return None
+    hosts = []
+    for server in servers.values():
+        for route in server.get("routes") or []:
+            for match in route.get("match") or []:
+                hosts += match.get("host") or []
+    return sorted(set(hosts))
+
+
+# ── compose ─────────────────────────────────────────────────────────────
+
+def compose_args(name, app, source):
+    env_file = site_dir(name) / ".env"
+    if not env_file.exists():
+        raise DeployError("환경 파일이 없습니다: %s" % env_file)
+    ref = app.get("composeFile", "source:compose.yaml")
+    if ref.startswith("source:"):
+        if not source:
+            raise DeployError("이 사이트는 소스 체크아웃이 필요합니다. --source 로 경로를 주세요.")
+        path = Path(source) / ref.split(":", 1)[1]
+    else:
+        path = site_dir(name) / ref
+    if not path.exists():
+        raise DeployError("compose 파일이 없습니다: %s" % path)
+    return ["docker", "compose", "--project-name", name,
+            "--env-file", str(env_file), "-f", str(path)]
+
+
+def compose_config(name, app, source):
+    out = run(compose_args(name, app, source) + ["config", "--format", "json"])
+    return json.loads(out)
+
+
+# ── DB ──────────────────────────────────────────────────────────────────
+
+def db_names(name):
+    base = name.replace("-", "_")
+    return base, "%s_user" % base
+
+
+def provision_db(name, app):
+    """규칙 4-2. 전용 DB·유저를 만들고 타 사이트 접근을 차단한 뒤 실제로 검증한다."""
+    db, user = db_names(name)
+    exists = psql("SELECT 1 FROM pg_database WHERE datname='%s';" % db, quiet=True)
+    if exists:
+        print("  DB %s: 이미 있음 (건너뜀)" % db)
+        return None
+    password = run(["openssl", "rand", "-base64", "48"])
+    password = re.sub(r"[^A-Za-z0-9]", "", password)[:32]
+    psql("CREATE ROLE {u} LOGIN PASSWORD '{p}';\n"
+         "CREATE DATABASE {d} OWNER {u};\n"
+         "REVOKE ALL ON DATABASE {d} FROM PUBLIC;\n"
+         "GRANT CONNECT ON DATABASE {d} TO {u};".format(u=user, p=password, d=db))
+    verify_isolation(name, password)
+    print("  DB %s / 유저 %s 생성, 격리 검증 통과" % (db, user))
+    return "postgresql://%s:%s@postgres:5432/%s" % (user, password, db)
+
+
+def verify_isolation(name, password):
+    """자기 DB는 되고 관리 DB는 막히는지 확인한다. 규칙 4-2의 검증 단계."""
+    db, user = db_names(name)
+    env = ["-e", "PGPASSWORD=%s" % password]
+    ok = subprocess.run(["docker", "exec"] + env + [PG_CONTAINER, "psql", "-U", user,
+                        "-h", "127.0.0.1", "-d", db, "-tAc", "SELECT 1;"],
+                        capture_output=True, text=True)
+    if ok.returncode != 0:
+        raise DeployError("자기 DB에 접속하지 못했습니다:\n%s" % ok.stderr.strip())
+    blocked = subprocess.run(["docker", "exec"] + env + [PG_CONTAINER, "psql", "-U", user,
+                             "-h", "127.0.0.1", "-d", "postgres", "-tAc", "SELECT 1;"],
+                             capture_output=True, text=True)
+    if blocked.returncode == 0:
+        raise DeployError("격리 실패: %s 유저가 관리 DB에 접속됩니다. REVOKE를 확인하세요." % user)
+
+
+def connection_headroom(sites):
+    """규칙 4-3. max_connections >= (사이트별 풀 합) + 10 인지 본다."""
+    limit = int(psql("SHOW max_connections;", quiet=True))
+    need = sum(s.get("poolSize", DEFAULT_POOL) for s in sites.values()) + 10
+    return limit, need
+
+
+# ── 검사 ────────────────────────────────────────────────────────────────
+
+def check(results, ok, label, detail=""):
+    results.append((ok, label, detail))
+    return ok
+
+
+def validate(name, source=None, quiet=False):
+    app = load(name)
+    sites = all_sites()
+    results = []
+
+    check(results, bool(NAME_RE.match(name)), "사이트명 형식", "소문자·숫자·하이픈만")
+
+    dup = [n for n, s in sites.items() if n != name and s.get("port") == app.get("port")]
+    check(results, not dup, "포트 %s 중복 없음" % app.get("port"), "겹침: %s" % ", ".join(dup))
+
+    dup = [n for n, s in sites.items() if n != name and s.get("domain") == app.get("domain")]
+    check(results, not dup, "도메인 중복 없음", "겹침: %s" % ", ".join(dup))
+
+    limit, need = connection_headroom(sites)
+    check(results, need <= limit, "커넥션 여유 (%d 필요 / %d 상한)" % (need, limit),
+          "max_connections를 올리고 Postgres를 재시작하세요.")
+
+    try:
+        addrs = socket.getaddrinfo(app["domain"], None, socket.AF_INET)
+        ips = sorted({a[4][0] for a in addrs})
+    except socket.gaierror:
+        ips = []
+    check(results, bool(ips), "DNS %s" % app["domain"], "A 레코드를 먼저 등록하세요.")
+
+    cfg = compose_config(name, app, source)
+    services = cfg.get("services") or {}
+
+    bad = [s for s, v in services.items() if str(v.get("platform", "")).endswith("amd64")]
+    check(results, not bad, "arm64 전용 (규칙 3-1)", "platform 지정: %s" % ", ".join(bad))
+
+    exposed = []
+    for svc, v in services.items():
+        for p in v.get("ports") or []:
+            host_ip = p.get("host_ip") if isinstance(p, dict) else None
+            if host_ip != "127.0.0.1":
+                exposed.append("%s 의 %s:%s (127.0.0.1 로 바꾸세요)"
+                               % (svc, host_ip or "0.0.0.0", p.get("published") if isinstance(p, dict) else p))
+    check(results, not exposed, "포트 127.0.0.1 바인딩 (규칙 5-1)", "; ".join(exposed))
+
+    own_pg = [s for s, v in services.items() if "postgres" in str(v.get("image", ""))]
+    check(results, not own_pg, "전용 Postgres 없음 (규칙 4-1)", "발견: %s" % ", ".join(own_pg))
+
+    nets = cfg.get("networks") or {}
+    check(results, DBNET in nets and nets[DBNET].get("external"),
+          "%s 외부 네트워크 참여" % DBNET, "compose에 external: true 로 선언하세요.")
+
+    images = sorted({v["image"] for v in services.values() if v.get("image")})
+    for image in images:
+        arch = run(["docker", "image", "inspect", image, "--format", "{{.Os}}/{{.Architecture}}"],
+                   check=False)
+        if not arch:
+            check(results, True, "이미지 %s" % image, "로컬에 없음 — 빌드 후 확인됨")
+        else:
+            check(results, arch == "linux/arm64", "이미지 %s = %s" % (image, arch))
+
+    if not quiet:
+        for ok, label, detail in results:
+            print("  %s %s" % ("OK  " if ok else "실패", label))
+            if not ok and detail:
+                print("       → %s" % detail)
+    failed = [r for r in results if not r[0]]
+    if failed:
+        raise DeployError("검사 %d건 실패" % len(failed))
+    return app
+
+
+# ── 명령 ────────────────────────────────────────────────────────────────
+
+def cmd_init(args):
+    name = args.name
+    if not NAME_RE.match(name):
+        raise DeployError("사이트명은 소문자·숫자·하이픈만 씁니다: %s" % name)
+    sites = all_sites()
+    if name in sites and not args.force:
+        raise DeployError("이미 등록된 사이트입니다: %s (--force 로 덮어쓰기)" % name)
+    for other, s in sites.items():
+        if other != name and s.get("domain") == args.domain:
+            raise DeployError("도메인이 이미 사용 중입니다: %s (%s)" % (args.domain, other))
+
+    taken = {s.get("port") for n, s in sites.items() if n != name}
+    port = args.port or allocate_port(taken)
+    if port in taken:
+        raise DeployError("포트가 이미 사용 중입니다: %s" % port)
+
+    app = {
+        "name": name,
+        "domain": args.domain,
+        "port": port,
+        "healthPath": args.health_path,
+        "repository": args.repo or "",
+        "composeFile": args.compose,
+        "poolSize": args.pool,
+    }
+    if args.max_upload:
+        app["maxUploadMB"] = args.max_upload
+    write_atomic(manifest_path(name), json.dumps(app, indent=2, ensure_ascii=False) + "\n")
+    print("매니페스트: %s" % manifest_path(name))
+    print("  도메인 %s · 포트 %d · 풀 %d" % (app["domain"], app["port"], app["poolSize"]))
+
+    if args.db:
+        url = provision_db(name, app)
+        if url:
+            print("  접속 문자열(사이트 .env에 넣으세요):\n    DATABASE_URL=%s?connection_limit=%d"
+                  % (url, app["poolSize"]))
+    env_file = site_dir(name) / ".env"
+    if not env_file.exists():
+        write_atomic(env_file, "# %s 운영 설정. git에 올리지 않는다.\n" % name, mode=0o600)
+        print("  환경 파일 생성: %s (600)" % env_file)
+    return 0
+
+
+def cmd_validate(args):
+    print("검사: %s" % args.name)
+    validate(args.name, args.source)
+    print("전부 통과")
+    return 0
+
+
+def cmd_deploy(args):
+    name = args.name
+    print("[1/5] 검사")
+    app = validate(name, args.source, quiet=args.quiet)
+    base = compose_args(name, app, args.source)
+
+    if not args.no_build:
+        print("[2/5] 이미지 빌드")
+        run(base + ["build"], capture=False)
+    else:
+        print("[2/5] 빌드 건너뜀")
+
+    print("[3/5] 컨테이너 기동")
+    run(base + ["up", "-d", "--remove-orphans"] + (["--no-build"] if args.no_build else []),
+        capture=False)
+
+    print("[4/5] Caddy 사이트 등록")
+    changed = write_site(app)
+    caddy_reload()
+    print("     %s · reload 완료" % ("사이트 파일 갱신" if changed else "사이트 파일 변동 없음"))
+
+    print("[5/5] HTTPS 확인")
+    url = "https://%s%s" % (app["domain"], app.get("healthPath", "/"))
+    deadline = time.time() + args.timeout
+    last = ""
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                print("     %s → HTTP %d" % (url, r.status))
+                return 0
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                print("     %s → HTTP %d" % (url, e.code))
+                return 0
+            last = "HTTP %d" % e.code
+        except Exception as e:
+            last = str(e)
+        time.sleep(3)
+    raise DeployError("HTTPS 확인이 %d초 안에 끝나지 않았습니다. 마지막 응답: %s" % (args.timeout, last))
+
+
+def cmd_status(args):
+    sites = all_sites()
+    if args.name:
+        sites = {args.name: load(args.name)}
+    if not sites:
+        print("등록된 사이트가 없습니다.")
+        return 0
+    hosts = caddy_hosts()
+    limit, need = connection_headroom(all_sites())
+    print("Caddy: %s" % ("응답 없음" if hosts is None else "%d개 사이트 로드됨" % len(hosts)))
+    print("커넥션: %d 필요 / %d 상한\n" % (need, limit))
+    for name, app in sorted(sites.items()):
+        ps = run(["docker", "ps", "--filter", "label=com.docker.compose.project=%s" % name,
+                  "--format", "{{.Names}}\t{{.Status}}"], check=False)
+        running = len([l for l in ps.splitlines() if l.strip()])
+        served = hosts is not None and app["domain"] in hosts
+        code = ""
+        try:
+            with urllib.request.urlopen("https://%s%s" % (app["domain"], app.get("healthPath", "/")),
+                                        timeout=10) as r:
+                code = str(r.status)
+        except urllib.error.HTTPError as e:
+            code = str(e.code)
+        except Exception:
+            code = "실패"
+        print("%s" % name)
+        print("  도메인 %s (Caddy %s) · HTTPS %s" % (app["domain"], "등록" if served else "미등록", code))
+        print("  포트 127.0.0.1:%s · 컨테이너 %d개" % (app["port"], running))
+        for line in ps.splitlines():
+            if line.strip():
+                print("    %s" % line.replace("\t", "  "))
+    return 0
+
+
+def cmd_remove(args):
+    name = args.name
+    app = load(name)
+    if not args.yes:
+        raise DeployError("되돌릴 수 없는 작업입니다. 확인했으면 --yes 를 붙이세요.")
+    print("[1/3] 컨테이너 정리")
+    try:
+        run(compose_args(name, app, args.source) + ["down", "--remove-orphans"], capture=False)
+    except DeployError as e:
+        print("     compose down 건너뜀: %s" % str(e).splitlines()[0])
+    print("[2/3] Caddy 사이트 해제")
+    path = CADDY_SITES / ("%s.caddy" % app["domain"])
+    if path.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.move(str(path), str(path.with_name("%s.removed.%s" % (path.name, stamp))))
+        caddy_reload()
+    print("[3/3] DB")
+    db, user = db_names(name)
+    print("     DB %s 와 유저 %s 는 남겨 둡니다. 지우려면 직접 실행하세요:" % (db, user))
+    print("       docker exec -i postgres psql -U postgres -c 'DROP DATABASE %s;' -c 'DROP ROLE %s;'"
+          % (db, user))
+    print("     매니페스트도 남습니다: %s" % manifest_path(name))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="deployctl", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="사이트 등록 · 포트 배정 · DB 프로비저닝")
+    p.add_argument("name")
+    p.add_argument("--domain", required=True)
+    p.add_argument("--port", type=int, help="생략하면 9000번대에서 자동 배정")
+    p.add_argument("--repo", default="")
+    p.add_argument("--compose", default="source:compose.yaml",
+                   help="source:<파일> 이면 러너 체크아웃 기준, 아니면 ~/srv/<사이트>/ 기준")
+    p.add_argument("--health-path", default="/")
+    p.add_argument("--pool", type=int, default=DEFAULT_POOL, help="DB 커넥션 풀 상한")
+    p.add_argument("--max-upload", type=int, help="업로드 상한(MB)")
+    p.add_argument("--db", action="store_true", help="전용 DB·유저를 함께 만든다")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("validate", help="규칙 위반 검사")
+    p.add_argument("name")
+    p.add_argument("--source", help="러너 체크아웃 경로")
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("deploy", help="빌드 · 기동 · Caddy 등록 · HTTPS 확인")
+    p.add_argument("name")
+    p.add_argument("--source", help="러너 체크아웃 경로")
+    p.add_argument("--no-build", action="store_true")
+    p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--quiet", action="store_true", help="검사 항목을 출력하지 않는다")
+    p.set_defaults(func=cmd_deploy)
+
+    p = sub.add_parser("status", help="컨테이너 · Caddy · HTTPS 상태")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("remove", help="컨테이너와 Caddy 사이트 해제 (DB는 남긴다)")
+    p.add_argument("name")
+    p.add_argument("--source")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_remove)
+
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except DeployError as e:
+        print("오류: %s" % e, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
