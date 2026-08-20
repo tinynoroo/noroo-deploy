@@ -278,8 +278,30 @@ colima·runner가 로그인을 기다리는 동안에도 Caddy는 살아 있어�
 > **규칙 8-1.** self-hosted runner는 **private 저장소에만** 연결한다.
 > public 저장소에 붙이면 임의의 PR 코드가 이 맥에서 실행된다.
 
-- runner는 `~/actions-runner`, LaunchAgent로 등록 (`./svc.sh install`)
-- `~/actions-runner/.env`에 PATH를 명시한다. LaunchAgent는 로그인 셸 환경을 상속하지 않아
+> **규칙 8-2.** 러너는 **저장소마다 하나씩** 붙인다. `deployctl runner <사이트>`로 등록한다.
+
+`tinynoroo`는 **Organization이 아니라 개인(User) 계정**이라 조직 단위 러너를 쓸 수 없다.
+GitHub의 조직 단위 러너는 Organization/Enterprise 계정에만 있다. 따라서 저장소가 늘 때마다
+러너 인스턴스가 하나씩 늘어난다 (실측 상주 메모리 러너당 약 134 MB).
+사이트가 많아져 부담이 되면 Organization을 만들어 저장소를 옮기는 쪽이 답이다.
+
+- 러너는 **`~/actions-runner/<사이트>/`** 아래로 모은다. 홈에 흩어 놓지 않는다.
+  ```
+  ~/actions-runner/
+  ├── actions-runner-osx-arm64-<버전>.tar.gz   # 공용 배포본
+  ├── king-maker/
+  └── myapp/
+  ```
+- 러너 이름은 `mac-<사이트>`, 라벨은 사이트명이다. 예외를 두지 않는다.
+- 배포본 tarball은 위 공용 자리의 것을 재사용하고, 없으면 최신을 내려받는다.
+- 디렉터리를 옮기면 LaunchAgent는 따라오지 않는다. `deployctl runner <사이트>`가
+  등록이 살아 있는지 보고 서비스만 다시 건다.
+- 워크플로의 `runs-on`에 **사이트명 라벨**을 넣어 러너를 특정한다.
+  ```yaml
+  runs-on: [self-hosted, macOS, ARM64, <사이트>]
+  ```
+  라벨이 겹치는 러너가 여러 대면 아무 데서나 돌 수 있다. 쓰지 않는 러너는 반드시 해제한다.
+- 러너 `.env`에 PATH를 명시한다. LaunchAgent는 로그인 셸 환경을 상속하지 않아
   이게 없으면 `docker: command not found`가 난다.
   ```
   PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
@@ -308,9 +330,10 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
    특히 `prune --volumes`는 서비스가 내려간 상태에서 실행하면 DB 데이터가 삭제된다.
 2. **사이트 추가는 `deployctl`로 한다** (§11). 위 규칙 대부분을 기계가 검사·수행한다.
    ```bash
-   deployctl init <사이트> --domain <도메인> --db     # 포트 배정 + DB + 격리 검증
-   deployctl validate <사이트> --source <경로>        # 규칙 위반 검사
-   deployctl deploy   <사이트> --source <경로>        # 기동 + Caddy 등록 + HTTPS 확인
+   deployctl init                                    # 준비물 안내 후 항목을 하나씩 물어본다
+   deployctl init <사이트> --domain <도메인> --db     # 인자를 다 주면 묻지 않는다 (CI용)
+   deployctl validate <사이트>                        # 규칙 위반 검사
+   deployctl deploy   <사이트>                        # 기동 + Caddy 등록 + HTTPS 확인
    ```
    손으로 할 때만 아래를 직접 확인한다.
    - [ ] 이미지 arm64 확인
@@ -332,11 +355,47 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
 
 | 명령 | 하는 일 |
 |---|---|
-| `init` | 매니페스트 생성, 포트 자동 배정(9000–9099), 전용 DB·유저 생성 + 격리 검증, `.env` 뼈대(600) |
-| `validate` | 사이트명·포트·도메인 중복, 커넥션 여유, DNS, arm64, `127.0.0.1` 바인딩, 전용 Postgres 금지, `dbnet` 참여 |
+| `init` | 매니페스트 생성, 포트 자동 배정(9000–9099), `~/workspaces/<사이트>`로 clone, 전용 DB·유저 생성 + 격리 검증, `.env`에 `DATABASE_URL` 기록(600) |
+| `validate` | 사이트명·포트·도메인 중복, 커넥션 여유, DNS, arm64, `127.0.0.1` 바인딩, **게시 포트 == `app.json` 포트**, 전용 Postgres 금지, `dbnet` 참여, **빌드 정의 없는 이미지의 존재 여부** |
 | `deploy` | 검사 → 빌드 → 기동 → Caddy 사이트 등록·reload → HTTPS 폴링 |
 | `status` | 컨테이너·Caddy 등록·HTTPS·커넥션 현황 |
+| `scaffold` | **없는** `Dockerfile`·compose 생성 (Dockerfile은 `claude -p` 초안 → `docker build` 검증, 실패 시 오류 되먹여 재시도) |
+| `workflow` | `.github/workflows/deploy.yml` 생성 (docker 대기 → checkout → deploy, `runs-on`에 사이트 라벨) |
+| `runner` | 저장소 전용 Actions 러너 등록 (private 확인 → 배포본 전개 → 토큰 발급 → LaunchAgent 기동), `--remove`로 해제 |
 | `remove` | 컨테이너 정리 + Caddy 사이트 해제 (DB와 매니페스트는 남긴다) |
+
+`init`은 **사이트명과 `--domain`이 둘 다 주어졌을 때만** 조용히 실행된다.
+하나라도 빠지면 준비물(private 저장소·A 레코드·Dockerfile+compose.yaml)을 먼저 안내하고
+항목을 하나씩 물은 뒤, 요약을 보여 주고 확인을 받는다. 확인 전에는 아무것도 만들지 않는다.
+비대화형 환경(러너 등)에서 인자가 빠지면 묻지 않고 오류를 낸다.
+
+첫 항목은 **`gh`로 읽은 저장소 목록**이다. 번호로 고르면 저장소 URL이 정해지고
+그 이름이 사이트명 기본값이 된다. 목록에서 빼는 것:
+
+- 이 서버에 이미 등록된 저장소 (`app.json`의 `repository` 또는 사이트명이 겹치는 것).
+  컨테이너가 떠 있는지는 보지 않는다 — 기준은 매니페스트 존재 여부다.
+- **public 저장소** — 러너에 붙이지 않는다 (규칙 8-1)
+
+각 줄에 루트의 `Dockerfile`·compose 파일 유무를 함께 띄워 배포 준비 여부를 보여 주고,
+준비된 저장소를 위로 올린다. `gh`가 없거나 로그인이 안 돼 있으면 URL을 직접 받는다.
+`--repo`를 주면 목록을 건너뛴다. **도메인은 목록과 무관하게 직접 입력한다.**
+
+확인을 받으면 아래를 이어서 한다. 사이트 하나를 올리는 데 필요한 것이 `init` 하나로 끝난다.
+
+1. `~/workspaces/<사이트>`로 clone (규칙 7-1, 이미 있으면 건너뜀)
+2. `Dockerfile`·compose가 없으면 만들지 물어본다 (§11-4)
+3. `.github/workflows/deploy.yml` 생성. 같은 디렉터리의 다른 self-hosted 워크플로가 있으면 알린다
+4. 전용 러너 등록 (규칙 8-2)
+5. 전용 DB·유저 생성 + `.env`에 `DATABASE_URL` 기록
+6. `deploy` — 검사 → 빌드 → 기동 → Caddy 등록 → HTTPS 확인
+
+러너 등록이 실패해도 나머지는 진행하고 `deployctl runner <사이트>`로 다시 하라고 안내한다.
+비대화형에서는 `--runner`·`--deploy`를 붙여야 각 단계를 한다.
+github 저장소는 `gh repo clone`으로 받는다 — 계정에 설정된 프로토콜(ssh)을 그대로 쓰기 위해서다.
+`git clone`에 https URL을 주면 비대화형에서 인증에 막힌다. 받지 않으려면 `--no-clone`.
+
+`--db`로 DB를 만들면 접속 문자열을 `~/srv/<사이트>/.env`의 `DATABASE_URL`에 **직접 기록한다**.
+이미 그 키가 있으면 덮어쓰지 않고 새 값을 화면에 출력만 한다.
 
 ### 11-1. 단일 진실 원천
 
@@ -349,6 +408,7 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
 ```
 
 - `composeFile`이 `source:<파일>`이면 러너 체크아웃(`--source`) 기준, 아니면 `~/srv/<사이트>/` 기준이다.
+  `--source`를 생략하면 `~/workspaces/<사이트>`를 쓴다. 러너 워크플로는 지금처럼 `--source`를 명시한다.
 - 앱 소스 경로는 매니페스트에 두지 않는다. 배포 기준은 **항상 러너 체크아웃 하나**다.
 
 ### 11-2. Caddy 파일 구조
@@ -366,3 +426,31 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
 호스트 Caddy가 `127.0.0.1:<포트>`로 프록시하므로 **사이트마다 포트가 하나씩 필요**하다.
 (traefik과 달리 컨테이너에 직접 라우팅할 수 없다. colima VM 네트워크가 호스트에서 닿지 않는다.)
 `init`이 9000번대에서 비어 있는 포트를 배정하고, `validate`가 중복을 막는다. 손으로 정하지 않는다.
+
+### 11-4. 스캐폴딩 — 없는 것만 만든다
+
+> **규칙 11-4.** 이미 있는 `Dockerfile`·compose는 **덮어쓰지 않는다.** `--force`를 줄 때만 예외.
+
+사람이 쓴 파일에는 생성기가 모르는 판단이 들어 있다 (king-maker compose의 `sessiond`
+빌드 제외 주석, `x-app-env` 앵커, 보안 경계). 규칙 위반이 있어도 `validate`가 **짚어만 주고**
+고치지 않는다.
+
+| 상태 | 하는 일 |
+|---|---|
+| 둘 다 있음 | 아무것도 만들지 않음 |
+| 둘 다 없음 | Dockerfile 생성 → 그 `EXPOSE`로 compose 생성 |
+| Dockerfile만 있음 | compose만 생성 |
+| compose만 있음 | Dockerfile만 생성 |
+
+**Dockerfile은 `claude -p`로 만들고 `docker build`로 검증한다.** 빌드가 실패하면 오류를
+프롬프트에 되먹여 다시 만든다 (기본 3회). 통과한 초안만 파일로 남는다. Claude에는
+`Read,Glob,Grep`만 준다 — 파일은 deployctl이 쓴다. 프롬프트에 규칙을 박는다:
+arm64 멀티아치 베이스(규칙 3-1), `--platform` 금지, non-root 실행, 시크릿 미포함, `EXPOSE` 명시.
+
+**배포 경로에는 넣지 않는다.** 러너 워크플로는 `claude` 없이 돌아야 하고, 배포는 재현
+가능해야 한다. 비대화형에서는 `--scaffold`를 명시할 때만 동작한다.
+
+compose는 LLM 없이 템플릿으로 찍는다. 사이트 `.env`에 `DATABASE_URL`이 있을 때만
+필수 변수로 박는다 — 없는데 박으면 기동 전에 죽는다.
+
+**생성물은 초안이다.** 검수하고 커밋하는 것은 사람이 한다.

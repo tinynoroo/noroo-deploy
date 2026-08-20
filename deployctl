@@ -21,10 +21,17 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 SRV = Path.home() / "srv"
+# 규칙 7-1. 소스는 여기에만 둔다. --source 를 생략하면 여기를 본다.
+WORKSPACES = Path.home() / "workspaces"
+# 규칙 8-1. 개인 계정은 조직 단위 러너를 못 쓰므로 저장소마다 러너를 하나씩 붙인다.
+# 러너는 홈에 흩어지지 않고 이 폴더 아래 사이트명 디렉터리로 모인다.
+RUNNER_BASE = Path.home() / "actions-runner"
+RUNNER_ENV = "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nLANG=C.UTF-8\n"
 CADDYFILE = Path("/opt/homebrew/etc/Caddyfile")
 CADDY_SITES = CADDYFILE.parent / "caddy-sites"
 CADDY_ADMIN = "http://127.0.0.1:2019"
@@ -34,6 +41,8 @@ DBNET = "dbnet"
 DEFAULT_POOL = 5
 PORT_RANGE = range(9000, 9100)
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# 저장소가 배포 준비됐는지 볼 때 찾는 이름들.
+COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
 
 
 class DeployError(Exception):
@@ -245,7 +254,15 @@ def compose_args(name, app, source):
     ref = app.get("composeFile", "source:compose.yaml")
     if ref.startswith("source:"):
         if not source:
-            raise DeployError("이 사이트는 소스 체크아웃이 필요합니다. --source 로 경로를 주세요.")
+            # 러너는 --source 를 주지만, 손으로 돌릴 때는 작업 공간이 기본이다.
+            fallback = WORKSPACES / name
+            if not fallback.exists():
+                raise DeployError(
+                    "소스 체크아웃이 없습니다: %s\n"
+                    "  --source 로 경로를 주거나, 먼저 받으세요:\n"
+                    "    %s"
+                    % (fallback, " ".join(clone_cmd(app.get("repository"), fallback))))
+            source = str(fallback)
         path = Path(source) / ref.split(":", 1)[1]
     else:
         path = site_dir(name) / ref
@@ -354,6 +371,15 @@ def validate(name, source=None, quiet=False):
                                % (svc, host_ip or "0.0.0.0", p.get("published") if isinstance(p, dict) else p))
     check(results, not exposed, "포트 127.0.0.1 바인딩 (규칙 5-1)", "; ".join(exposed))
 
+    published = set()
+    for svc, v in services.items():
+        for prt in v.get("ports") or []:
+            if isinstance(prt, dict) and prt.get("published"):
+                published.add(int(prt["published"]))
+    check(results, not published or app["port"] in published,
+          "게시 포트 %s == app.json 포트" % (sorted(published) or "없음"),
+          "Caddy는 127.0.0.1:%d 로 프록시합니다. compose 나 .env 의 포트를 맞추세요." % app["port"])
+
     own_pg = [s for s, v in services.items() if "postgres" in str(v.get("image", ""))]
     check(results, not own_pg, "전용 Postgres 없음 (규칙 4-1)", "발견: %s" % ", ".join(own_pg))
 
@@ -361,11 +387,18 @@ def validate(name, source=None, quiet=False):
     check(results, DBNET in nets and nets[DBNET].get("external"),
           "%s 외부 네트워크 참여" % DBNET, "compose에 external: true 로 선언하세요.")
 
+    # build 도 없고 pull 도 막힌 이미지는 아무도 만들어 주지 않는다. 미리 잡는다.
+    unbuildable = {v["image"] for v in services.values()
+                   if v.get("image") and not v.get("build")
+                   and str(v.get("pull_policy", "")) == "never"}
     images = sorted({v["image"] for v in services.values() if v.get("image")})
     for image in images:
         arch = run(["docker", "image", "inspect", image, "--format", "{{.Os}}/{{.Architecture}}"],
                    check=False)
-        if not arch:
+        if not arch and image in unbuildable:
+            check(results, False, "이미지 %s" % image,
+                  "compose에 build가 없고 pull_policy가 never입니다. 손으로 먼저 만드세요.")
+        elif not arch:
             check(results, True, "이미지 %s" % image, "로컬에 없음 — 빌드 후 확인됨")
         else:
             check(results, arch == "linux/arm64", "이미지 %s = %s" % (image, arch))
@@ -381,9 +414,689 @@ def validate(name, source=None, quiet=False):
     return app
 
 
+# ── GitHub 저장소 ───────────────────────────────────────────────────────
+
+def gh_ready():
+    """gh 가 깔려 있고 로그인돼 있는지. 아니면 URL을 직접 받는 쪽으로 물러난다."""
+    if not shutil.which("gh"):
+        return False
+    p = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    return p.returncode == 0
+
+
+def gh_repos():
+    """계정의 저장소 목록. 읽지 못하면 None."""
+    p = subprocess.run(["gh", "repo", "list", "--limit", "200", "--json",
+                        "name,nameWithOwner,url,visibility,updatedAt,description,"
+                        "defaultBranchRef"], capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        return None
+
+
+def repo_files(repo):
+    """저장소 루트의 파일 이름들. 읽지 못하면 None."""
+    branch = (repo.get("defaultBranchRef") or {}).get("name") or "HEAD"
+    p = subprocess.run(["gh", "api", "repos/%s/git/trees/%s" % (repo["nameWithOwner"], branch)],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    try:
+        tree = json.loads(p.stdout).get("tree") or []
+    except ValueError:
+        return None
+    return {n["path"] for n in tree if n.get("type") == "blob"}
+
+
+def annotate(repos):
+    """각 저장소에 Dockerfile·compose 유무를 붙인다. 목록을 한 번에 조회한다."""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for repo, files in zip(repos, pool.map(repo_files, repos)):
+            repo["checked"] = files is not None
+            if files is None:
+                repo["note"] = "확인 못 함"
+                repo["ready"] = False
+                continue
+            missing = []
+            if "Dockerfile" not in files:
+                missing.append("Dockerfile")
+            if not any(c in files for c in COMPOSE_NAMES):
+                missing.append("compose")
+            repo["ready"] = not missing
+            repo["note"] = "준비됨" if not missing else "%s 없음" % "·".join(missing)
+
+
+def slug(text):
+    """저장소 이름에서 사이트명 후보를 만든다. 규칙 7-2의 소문자·하이픈."""
+    out = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return out if NAME_RE.match(out or "") else ""
+
+
+def pick_repo(sites):
+    """저장소를 골라 돌려준다. 목록을 못 쓰거나 직접 입력을 고르면 None."""
+    if not gh_ready():
+        print("gh 로 저장소 목록을 읽을 수 없어 URL을 직접 받습니다."
+              " (gh auth login 을 하면 목록에서 고를 수 있습니다)\n")
+        return None
+    print("저장소 목록을 읽는 중…")
+    repos = gh_repos()
+    if not repos:
+        print("저장소를 읽지 못했습니다. URL을 직접 넣으세요.\n")
+        return None
+
+    used = {(s.get("repository") or "").rstrip("/").lower() for s in sites.values()}
+    used.discard("")
+    registered, public, cands = [], [], []
+    for repo in repos:
+        if repo["url"].rstrip("/").lower() in used or repo["name"] in sites:
+            registered.append(repo["name"])
+        elif repo.get("visibility") != "PRIVATE":
+            public.append(repo["name"])
+        else:
+            cands.append(repo)
+
+    if registered:
+        print("  이 서버에 이미 등록돼 있어 뺀 것: %s" % ", ".join(sorted(registered)))
+    if public:
+        print("  public 이라 뺀 것 (규칙 8-1): %s" % ", ".join(sorted(public)))
+    if not cands:
+        print("  고를 수 있는 저장소가 없습니다. URL을 직접 넣으세요.\n")
+        return None
+
+    annotate(cands)
+    # 배포 준비된 것부터, 그다음 최근에 손댄 순서.
+    cands.sort(key=lambda r: (r["ready"], r["updatedAt"]), reverse=True)
+
+    print("\n배포할 저장소를 고르세요.")
+    name_w = max(len(r["name"]) for r in cands)
+    note_w = max(len(r["note"]) for r in cands)
+    for i, repo in enumerate(cands, 1):
+        desc = (repo.get("description") or "").splitlines()
+        desc = desc[0] if desc else ""
+        if len(desc) > 40:
+            desc = desc[:39] + "…"
+        print(("  %2d  %-*s  %s  %-*s  %s"
+               % (i, name_w, repo["name"], repo["updatedAt"][:10],
+                  note_w, repo["note"], desc)).rstrip())
+    print("   0  목록에 없음 — URL을 직접 입력")
+
+    def check_choice(v):
+        if not v.isdigit() or not (0 <= int(v) <= len(cands)):
+            return "0 부터 %d 사이의 번호를 넣으세요." % len(cands)
+        return None
+
+    choice = int(ask("번호", check_fn=check_choice))
+    if choice == 0:
+        return None
+    picked = cands[choice - 1]
+    if not picked["checked"]:
+        print("    %s 의 파일 목록을 읽지 못했습니다. Dockerfile 과 compose 는 직접 확인하세요."
+              % picked["name"])
+    elif not picked["ready"]:
+        print("    %s: %s — deploy 전까지 저장소에 넣으세요."
+              % (picked["name"], picked["note"]))
+    return picked
+
+
+# ── Actions 러너 ────────────────────────────────────────────────────────
+
+def repo_slug(url):
+    m = re.match(r"https?://github\.com/([^/]+/[^/.]+)", url or "")
+    if not m:
+        raise DeployError("GitHub 저장소 URL이 아닙니다: %s" % (url or "(비어 있음)"))
+    return m.group(1)
+
+
+def runner_dir(name):
+    return RUNNER_BASE / name
+
+
+def gh_json(path, method="GET"):
+    cmd = ["gh", "api", path] + (["-X", method] if method != "GET" else [])
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise DeployError("gh api 실패 (%s):\n%s" % (path, (p.stderr or p.stdout).strip()))
+    return json.loads(p.stdout)
+
+
+def runner_package():
+    """러너 배포본. 이미 받아 둔 tarball을 재사용하고, 없으면 최신을 내려받는다."""
+    # 배포본 tarball 은 러너들 위 공용 자리에 둔다.
+    local = sorted(RUNNER_BASE.glob("actions-runner-osx-arm64-*.tar.gz"))
+    if local:
+        return local[-1]
+    release = gh_json("repos/actions/runner/releases/latest")
+    version = release["tag_name"].lstrip("v")
+    url = ("https://github.com/actions/runner/releases/download/"
+           "v{v}/actions-runner-osx-arm64-{v}.tar.gz".format(v=version))
+    dest = RUNNER_BASE / ("actions-runner-osx-arm64-%s.tar.gz" % version)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print("  러너 배포본 내려받는 중: %s" % url)
+    run(["curl", "-fsSL", "-o", str(dest), url], capture=False)
+    return dest
+
+
+def runner_install(name, app):
+    """저장소 전용 러너를 등록하고 LaunchAgent로 띄운다."""
+    slug = repo_slug(app.get("repository"))
+    if not gh_ready():
+        raise DeployError("gh 로그인이 필요합니다: gh auth login")
+    if not gh_json("repos/%s" % slug)["private"]:
+        raise DeployError("public 저장소에는 러너를 붙이지 않습니다 (규칙 8-1): %s" % slug)
+
+    path = runner_dir(name)
+    if (path / ".runner").exists():
+        print("  러너가 이미 등록돼 있습니다: %s" % path)
+        # 디렉터리를 옮기면 LaunchAgent 는 따라오지 않는다. 서비스만 다시 건다.
+        ensure_service(path)
+        return path
+
+    if not path.exists():
+        package = runner_package()
+        path.mkdir(parents=True)
+        print("  배포본 풀기: %s → %s" % (package.name, path))
+        run(["tar", "xzf", str(package), "-C", str(path)], capture=False)
+
+    # LaunchAgent는 로그인 셸 환경을 상속하지 않는다. PATH가 없으면 docker를 못 찾는다.
+    write_atomic(path / ".env", RUNNER_ENV)
+
+    token = gh_json("repos/%s/actions/runners/registration-token" % slug, "POST")["token"]
+    print("  등록: %s (라벨 %s)" % (slug, name))
+    run([str(path / "config.sh"), "--url", "https://github.com/%s" % slug,
+         "--token", token, "--name", "mac-%s" % name, "--labels", name,
+         "--work", "_work", "--unattended", "--replace"], capture=False, cwd=str(path))
+
+    ensure_service(path)
+    return path
+
+
+def ensure_service(path):
+    """LaunchAgent 가 이 경로로 걸려 있게 한다. 없으면 설치하고 띄운다."""
+    if (path / ".service").exists():
+        plist = (path / ".service").read_text().strip()
+        agent = Path.home() / "Library" / "LaunchAgents" / plist
+        if agent.exists() and str(path) in agent.read_text():
+            run([str(path / "svc.sh"), "start"], capture=False, check=False, cwd=str(path))
+            print("  서비스: 이미 걸려 있음 (%s)" % plist)
+            return
+    print("  서비스 등록·기동")
+    run([str(path / "svc.sh"), "install"], capture=False, cwd=str(path))
+    run([str(path / "svc.sh"), "start"], capture=False, cwd=str(path))
+
+
+def runner_remove(name, app):
+    slug = repo_slug(app.get("repository"))
+    path = runner_dir(name)
+    if not path.exists():
+        raise DeployError("러너가 없습니다: %s" % path)
+    if (path / ".service").exists():
+        run([str(path / "svc.sh"), "stop"], capture=False, check=False, cwd=str(path))
+        run([str(path / "svc.sh"), "uninstall"], capture=False, check=False, cwd=str(path))
+    if (path / ".runner").exists():
+        token = gh_json("repos/%s/actions/runners/remove-token" % slug, "POST")["token"]
+        run([str(path / "config.sh"), "remove", "--token", token],
+            capture=False, check=False, cwd=str(path))
+    return path
+
+
+def runner_status(name, app):
+    """이 사이트에 붙은 러너의 상태. gh 를 못 쓰면 None."""
+    if not (runner_dir(name) / ".runner").exists():
+        return None
+    try:
+        slug = repo_slug(app.get("repository"))
+        runners = gh_json("repos/%s/actions/runners" % slug)["runners"]
+    except DeployError:
+        return "등록됨 (상태 확인 실패)"
+    mine = [r for r in runners if r["name"] == "mac-%s" % name]
+    if not mine:
+        return "로컬에만 있음 (저장소에서 사라짐)"
+    return mine[0]["status"]
+
+
+# ── 스캐폴딩 ────────────────────────────────────────────────────────────
+#
+# 없는 파일만 만든다. 이미 있는 Dockerfile·compose 는 사람이 쓴 것이므로
+# --force 없이는 손대지 않는다. 규칙 위반은 validate 가 짚어 줄 뿐 고치지 않는다.
+
+DOCKERFILE_PROMPT = """\
+이 저장소를 빌드해 실행하는 Dockerfile 하나를 만들어라. 저장소를 먼저 읽고 판단해라.
+
+지켜야 할 것:
+- 베이스 이미지는 linux/arm64 를 지원하는 멀티아치 태그를 쓴다. amd64 고정 태그 금지.
+- Dockerfile 안에 --platform 을 적지 않는다.
+- 최종 실행은 non-root 사용자로 한다.
+- 비밀값을 이미지에 굽지 않는다. 런타임 환경 변수로 받는다.
+- 애플리케이션이 듣는 포트를 EXPOSE 로 정확히 한 줄 적는다.
+- 의존성 설치와 소스 복사를 나눠 레이어 캐시가 살게 한다.
+
+주석은 이 Dockerfile 을 읽는 사람에게 필요한 것만 남긴다. 이전 초안이나 빌드 오류,
+고친 경위를 주석으로 언급하지 마라. 처음부터 그렇게 쓴 파일처럼 보여야 한다.
+
+출력은 Dockerfile 내용 그 자체만. 설명도 머리말도 코드펜스도 붙이지 마라.{feedback}
+"""
+
+DOCKERFILE_RETRY = """
+
+직전 초안은 빌드에 실패했다. 오류를 보고 고쳐서 다시 내라.
+
+--- docker build 오류 ---
+{error}
+--- 끝 ---
+"""
+
+COMPOSE_TEMPLATE = """\
+# deployctl이 만들었다. 규칙에 맞는 최소 형태이니 앱에 맞게 고쳐 쓴다.
+services:
+  app:
+    build: .
+    image: {name}:local
+    restart: unless-stopped
+{env_block}    ports:
+      # 호스트 Caddy가 이 포트로 프록시한다. app.json 의 port 와 같아야 한다.
+      - "127.0.0.1:{host_port}:{container_port}"
+    networks: [default, dbnet]
+    logging:
+      driver: json-file
+      options: {{ max-size: "10m", max-file: "3" }}
+
+networks:
+  # 공유 Postgres 가 사는 네트워크. ~/srv/postgres 스택이 만든다.
+  dbnet:
+    external: true
+"""
+
+
+def strip_fences(text):
+    """모델이 코드펜스를 붙였을 때만 벗긴다."""
+    lines = text.strip().splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+        while lines and not lines[-1].startswith("```"):
+            lines.pop()
+        if lines:
+            lines.pop()
+    return "\n".join(lines).strip() + "\n"
+
+
+def exposed_port(text):
+    m = re.search(r"^\s*EXPOSE\s+(\d+)", text, re.M)
+    return int(m.group(1)) if m else None
+
+
+def generate_dockerfile(name, checkout, attempts=3):
+    """claude 로 초안을 받아 실제 빌드로 검증한다. 통과한 것만 남긴다."""
+    if not shutil.which("claude"):
+        raise DeployError("claude 를 찾을 수 없습니다. Dockerfile 을 직접 작성하세요.")
+    draft = checkout / ".deployctl-dockerfile-draft"
+    feedback = ""
+    try:
+        for attempt in range(1, attempts + 1):
+            print("  Dockerfile 초안 생성 (%d/%d) — 저장소를 읽는 중" % (attempt, attempts))
+            text = run(["claude", "-p", DOCKERFILE_PROMPT.format(feedback=feedback),
+                        "--allowedTools", "Read,Glob,Grep"], cwd=str(checkout))
+            text = strip_fences(text)
+            if "FROM" not in text:
+                feedback = DOCKERFILE_RETRY.format(error="FROM 이 없는 응답이 왔다.")
+                continue
+            draft.write_text(text)
+            print("  빌드로 검증하는 중")
+            probe = subprocess.run(
+                ["docker", "build", "-f", str(draft), "-t", "%s:scaffold-probe" % name,
+                 str(checkout)], capture_output=True, text=True)
+            if probe.returncode == 0:
+                print("  빌드 통과")
+                return text
+            error = (probe.stderr or probe.stdout).strip()[-3000:]
+            print("  빌드 실패 — 오류를 되먹여 다시 시도합니다")
+            feedback = DOCKERFILE_RETRY.format(error=error)
+    finally:
+        if draft.exists():
+            draft.unlink()
+        run(["docker", "image", "rm", "-f", "%s:scaffold-probe" % name], check=False)
+    raise DeployError("Dockerfile 을 %d회 시도했지만 빌드에 실패했습니다. 직접 작성하세요." % attempts)
+
+
+def scaffold(name, app, checkout, force=False, attempts=3, ask_port=True):
+    """없는 Dockerfile·compose 를 만든다. 만든 파일 목록을 돌려준다."""
+    made = []
+    dockerfile = checkout / "Dockerfile"
+    ref = app.get("composeFile", "source:compose.yaml")
+    compose = checkout / ref.split(":", 1)[1] if ref.startswith("source:") else site_dir(name) / ref
+
+    if dockerfile.exists() and not force:
+        print("  Dockerfile: 이미 있습니다 — 건드리지 않습니다")
+    else:
+        text = generate_dockerfile(name, checkout, attempts)
+        dockerfile.write_text(text)
+        print("  Dockerfile 생성: %s" % dockerfile)
+        made.append(dockerfile)
+
+    if compose.exists() and not force:
+        print("  %s: 이미 있습니다 — 건드리지 않습니다" % compose.name)
+        return made
+
+    port = exposed_port(dockerfile.read_text()) if dockerfile.exists() else None
+    if not port:
+        if ask_port and sys.stdin.isatty():
+            port = int(ask("컨테이너가 듣는 포트 — Dockerfile 에 EXPOSE 가 없습니다.",
+                           default="8000",
+                           check_fn=lambda v: None if v.isdigit() else "숫자로 입력하세요."))
+        else:
+            port = 8000
+            print("  EXPOSE 를 못 찾아 컨테이너 포트를 8000 으로 둡니다. 맞는지 확인하세요.")
+    # DB 를 받은 사이트에만 DATABASE_URL 을 필수로 박는다. 없는데 박으면 기동 전에 죽는다.
+    env_file = site_dir(name) / ".env"
+    has_db = env_file.exists() and any(
+        line.startswith("DATABASE_URL=") for line in env_file.read_text().splitlines())
+    if has_db:
+        env_block = ("    environment:\n"
+                     "      # 값은 ~/srv/%s/.env 에 있다. 쓸 변수를 이런 식으로 늘려 나간다.\n"
+                     "      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in ~/srv/%s/.env}\n"
+                     % (name, name))
+    else:
+        env_block = ("    # 환경 변수는 ~/srv/%s/.env 에 넣고 여기에 이렇게 잇는다.\n"
+                     "    #   environment:\n"
+                     "    #     SOME_KEY: ${SOME_KEY:?Set SOME_KEY in ~/srv/%s/.env}\n"
+                     % (name, name))
+    compose.parent.mkdir(parents=True, exist_ok=True)
+    compose.write_text(COMPOSE_TEMPLATE.format(name=name, host_port=app["port"],
+                                               container_port=port, env_block=env_block))
+    print("  %s 생성: %s (호스트 %d → 컨테이너 %d)"
+          % (compose.name, compose, app["port"], port))
+    made.append(compose)
+    return made
+
+
+# ── 워크플로 ────────────────────────────────────────────────────────────
+
+WORKFLOW_TEMPLATE = """\
+# deployctl이 생성한다. 사이트 정의는 ~/srv/{name}/app.json 에 있다.
+name: Deploy {name}
+
+on:
+  push:
+    branches: [{branch}]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: {name}-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy {name}
+    # 사이트명 라벨로 이 맥의 전용 러너를 특정한다 (규칙 8-2).
+    runs-on: [self-hosted, macOS, ARM64, {name}]
+    timeout-minutes: 30
+
+    steps:
+      # 재부팅 직후 러너가 colima(도커 VM)보다 먼저 뜰 수 있다.
+      - name: Wait for docker daemon
+        run: |
+          for _ in $(seq 60); do
+            docker info >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "docker daemon not ready" >&2
+          exit 1
+
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      # 검사 → 빌드 → 기동 → Caddy 등록 → HTTPS 확인까지 deployctl 이 한다.
+      - name: Deploy
+        run: deployctl deploy {name} --source "$GITHUB_WORKSPACE"
+"""
+
+
+def default_branch(checkout):
+    head = run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+               check=False, cwd=str(checkout))
+    return head or "main"
+
+
+def write_workflow(name, checkout):
+    """러너에서 도는 배포 워크플로를 만든다. git 이 이전 판을 들고 있어 백업은 남기지 않는다."""
+    path = Path(checkout) / ".github" / "workflows" / "deploy.yml"
+    text = WORKFLOW_TEMPLATE.format(name=name, branch=default_branch(checkout))
+    if path.exists() and path.read_text() == text:
+        print("  워크플로: 변동 없음 (%s)" % path)
+        return path, False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    verb = "갱신" if path.exists() else "생성"
+    path.write_text(text)
+    print("  워크플로 %s: %s" % (verb, path))
+    return path, True
+
+
+def stale_workflows(checkout):
+    """이 사이트의 배포와 부딪힐 수 있는 다른 워크플로."""
+    wf_dir = Path(checkout) / ".github" / "workflows"
+    if not wf_dir.exists():
+        return []
+    return [path for path in sorted(wf_dir.glob("*.y*ml"))
+            if path.name != "deploy.yml" and "self-hosted" in path.read_text(errors="replace")]
+
+
+# ── 대화형 입력 ─────────────────────────────────────────────────────────
+
+INIT_PREAMBLE = """\
+사이트를 등록합니다. 준비물:
+
+  1. GitHub 저장소 (private)
+  2. 도메인 A 레코드
+  3. 저장소 루트의 Dockerfile 과 compose.yaml
+
+포트·DB·Caddy 설정은 deployctl 이 잡습니다. 만드는 것은 매니페스트·.env·DB 뿐이고,
+마지막에 확인을 받기 전에는 아무것도 만들지 않습니다.
+"""
+
+
+def ask(prompt, default=None, check_fn=None):
+    """한 항목씩 묻는다. 빈 입력은 기본값. check_fn 은 오류 메시지나 None 을 돌려준다."""
+    suffix = " [%s]" % default if default not in (None, "") else ""
+    while True:
+        try:
+            raw = input("%s%s\n  > " % (prompt, suffix)).strip()
+        except EOFError:
+            raise DeployError("입력이 끊겼습니다.")
+        value = raw or (default or "")
+        if not value:
+            print("    값이 필요합니다.")
+            continue
+        problem = check_fn(value) if check_fn else None
+        if problem:
+            print("    %s" % problem)
+            continue
+        return value
+
+
+def ask_yes(prompt, default=True):
+    hint = "Y/n" if default else "y/N"
+    while True:
+        try:
+            raw = input("%s [%s]\n  > " % (prompt, hint)).strip().lower()
+        except EOFError:
+            raise DeployError("입력이 끊겼습니다.")
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("    y 또는 n 으로 답하세요.")
+
+
+def dns_hint(domain):
+    try:
+        addrs = socket.getaddrinfo(domain, None, socket.AF_INET)
+    except socket.gaierror:
+        return "아직 안 잡힘 — deploy 전까지 A 레코드를 등록하세요."
+    return "A 레코드 %s" % ", ".join(sorted({a[4][0] for a in addrs}))
+
+
+def prompt_init(args):
+    """init 의 대화형 모드. 빠진 항목만 하나씩 물어 args 를 채운다."""
+    sites = all_sites()
+    print(INIT_PREAMBLE)
+
+    picked = pick_repo(sites) if args.repo is None else None
+    if picked:
+        args.repo = picked["url"]
+        print("    고른 저장소: %s" % picked["nameWithOwner"])
+    elif args.repo is None:
+        repo = ask("GitHub 저장소 URL — 없으면 - 를 넣으세요.", default="-")
+        args.repo = "" if repo == "-" else repo
+
+    def check_name(v):
+        if not NAME_RE.match(v):
+            return "소문자·숫자·하이픈만 씁니다."
+        if v in sites and not args.force:
+            return "이미 등록된 사이트입니다. 덮어쓰려면 --force 를 붙여 다시 실행하세요."
+        return None
+
+    if not args.name:
+        suggested = slug(picked["name"]) if picked else None
+        if suggested and check_name(suggested):
+            suggested = None
+        args.name = ask("사이트명 — 소문자·하이픈. DB명과 디렉터리명이 여기서 나옵니다.",
+                        default=suggested, check_fn=check_name)
+    name = args.name
+
+    def check_domain(v):
+        for other, site in sites.items():
+            if other != name and site.get("domain") == v:
+                return "이미 %s 가 쓰고 있는 도메인입니다." % other
+        return None
+
+    if not args.domain:
+        args.domain = ask("도메인 — 예: %s.example.com" % name, check_fn=check_domain)
+    print("    %s" % dns_hint(args.domain))
+
+    taken = {s.get("port") for n, s in sites.items() if n != name}
+
+    def check_port(v):
+        if not v.isdigit():
+            return "숫자로 입력하세요."
+        if int(v) in taken:
+            return "이미 쓰는 포트입니다."
+        return None
+
+    if not args.port:
+        args.port = int(ask("호스트 포트 — 비어 있는 것으로 골라 뒀습니다. Enter 로 그대로 씁니다.",
+                            default=str(allocate_port(taken)), check_fn=check_port))
+
+    if args.compose is None:
+        args.compose = ask("compose 파일 — source:<파일> 이면 러너 체크아웃 기준, "
+                           "아니면 ~/srv/%s/ 기준." % name, default="source:compose.yaml")
+
+    if args.health_path is None:
+        args.health_path = ask("헬스체크 경로 — 배포 뒤 HTTPS 로 여기를 찔러 봅니다.", default="/")
+
+    if args.pool is None:
+        limit, need = connection_headroom(sites)
+        print("    커넥션: %d 필요 / %d 상한 (규칙 4-3)" % (need, limit))
+        args.pool = int(ask("DB 커넥션 풀 상한", default=str(DEFAULT_POOL),
+                            check_fn=lambda v: None if v.isdigit() else "숫자로 입력하세요."))
+
+    if args.max_upload is None:
+        raw = ask("업로드 상한(MB) — 제한을 두지 않으려면 - 를 넣으세요.", default="-",
+                  check_fn=lambda v: None if v == "-" or v.isdigit() else "숫자 또는 - 를 넣으세요.")
+        args.max_upload = None if raw == "-" else int(raw)
+
+    if not args.db:
+        args.db = ask_yes("전용 DB·유저를 지금 만들까요? (규칙 4-2)", default=True)
+
+    if args.deploy is None:
+        args.deploy = ask_yes("등록이 끝나면 바로 배포할까요? "
+                              "(빌드 → 기동 → Caddy 등록 → HTTPS 확인)", default=True)
+
+    if args.runner is None and args.repo:
+        args.runner = ask_yes("이 저장소 전용 Actions 러너를 붙일까요? "
+                              "(개인 계정은 저장소마다 하나씩 필요합니다)", default=True)
+
+    print("\n등록할 내용")
+    print("  사이트   %s" % args.name)
+    print("  도메인   %s" % args.domain)
+    print("  포트     127.0.0.1:%d" % args.port)
+    print("  저장소   %s" % (args.repo or "(없음)"))
+    print("  compose  %s" % args.compose)
+    print("  헬스체크 %s" % args.health_path)
+    print("  풀 상한  %d" % args.pool)
+    if args.max_upload:
+        print("  업로드   %d MB" % args.max_upload)
+    print("  전용 DB  %s" % ("만듭니다" if args.db else "만들지 않습니다"))
+    print("  러너     %s" % ("붙입니다" if args.runner else "붙이지 않습니다"))
+    print("  배포     %s" % ("바로 합니다" if args.deploy else "하지 않습니다"))
+    print()
+    if not ask_yes("이대로 진행할까요?", default=True):
+        raise DeployError("취소했습니다. 만들어진 것은 없습니다.")
+    print()
+
+
+def clone_cmd(url, path):
+    """받아 올 명령. github 저장소는 gh 로 받는다 — 계정에 설정된 프로토콜을 그대로 쓴다."""
+    slug_match = re.match(r"https?://github\.com/([^/]+/[^/.]+)", url or "")
+    if slug_match and shutil.which("gh"):
+        return ["gh", "repo", "clone", slug_match.group(1), str(path)]
+    return ["git", "clone", url, str(path)]
+
+
+def clone_repo(name, url):
+    """규칙 7-1. 작업 공간에 소스를 받아 둔다. 이미 있으면 그대로 쓴다."""
+    path = WORKSPACES / name
+    if path.exists():
+        print("  작업 공간: %s (이미 있음)" % path)
+        return path
+    if not url:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = clone_cmd(url, path)
+    print("  clone: %s" % " ".join(cmd))
+    try:
+        run(cmd, capture=False)
+    except DeployError as exc:
+        print("  clone 실패: %s" % str(exc).splitlines()[0])
+        return None
+    print("  작업 공간: %s" % path)
+    return path
+
+
+def put_env(name, key, value):
+    """사이트 .env 에 키를 넣는다. 이미 있으면 건드리지 않는다."""
+    env_file = site_dir(name) / ".env"
+    if env_file.exists():
+        lines = env_file.read_text().splitlines()
+    else:
+        lines = ["# %s 운영 설정. git에 올리지 않는다." % name]
+    if any(line.split("=", 1)[0].strip() == key for line in lines if "=" in line):
+        return False
+    lines.append("%s=%s" % (key, value))
+    write_atomic(env_file, "\n".join(lines) + "\n", mode=0o600)
+    return True
+
+
 # ── 명령 ────────────────────────────────────────────────────────────────
 
 def cmd_init(args):
+    # 이름과 도메인이 둘 다 오면 예전처럼 조용히 돈다. 하나라도 빠지면 물어본다.
+    if args.name is None or args.domain is None:
+        if not sys.stdin.isatty():
+            raise DeployError("대화형으로 물을 수 없는 환경입니다. "
+                              "<사이트명> 과 --domain 을 인자로 주세요.")
+        prompt_init(args)
+    args.repo = args.repo or ""
+    args.compose = args.compose or "source:compose.yaml"
+    args.health_path = args.health_path or "/"
+    args.pool = args.pool or DEFAULT_POOL
+
     name = args.name
     if not NAME_RE.match(name):
         raise DeployError("사이트명은 소문자·숫자·하이픈만 씁니다: %s" % name)
@@ -414,15 +1127,79 @@ def cmd_init(args):
     print("매니페스트: %s" % manifest_path(name))
     print("  도메인 %s · 포트 %d · 풀 %d" % (app["domain"], app["port"], app["poolSize"]))
 
+    checkout = None if args.no_clone else clone_repo(name, app["repository"])
+
+    if checkout:
+        ref = app.get("composeFile", "source:compose.yaml")
+        compose_path = (checkout / ref.split(":", 1)[1] if ref.startswith("source:")
+                        else site_dir(name) / ref)
+        missing = [p.name for p in (checkout / "Dockerfile", compose_path) if not p.exists()]
+        if missing:
+            print("  없는 파일: %s" % ", ".join(missing))
+            wanted = args.scaffold
+            if wanted is None and sys.stdin.isatty():
+                wanted = ask_yes("claude 로 초안을 만들고 빌드로 검증할까요? "
+                                 "(초안이므로 검수한 뒤 커밋하세요)", default=True)
+            if wanted:
+                try:
+                    scaffold(name, app, checkout)
+                except DeployError as exc:
+                    print("  스캐폴딩 실패: %s" % exc)
+
+    if checkout:
+        write_workflow(name, checkout)
+        for stale in stale_workflows(checkout):
+            print("  확인 필요: %s 도 self-hosted 러너를 씁니다." % stale)
+
+    runner_path = None
+    if args.runner:
+        try:
+            runner_path = runner_install(name, app)
+        except DeployError as exc:
+            print("  러너 등록 실패: %s" % exc)
+            print("  나중에 다시: deployctl runner %s" % name)
+
+    env_file = site_dir(name) / ".env"
     if args.db:
         url = provision_db(name, app)
         if url:
-            print("  접속 문자열(사이트 .env에 넣으세요):\n    DATABASE_URL=%s?connection_limit=%d"
-                  % (url, app["poolSize"]))
-    env_file = site_dir(name) / ".env"
+            full = "%s?connection_limit=%d" % (url, app["poolSize"])
+            if put_env(name, "DATABASE_URL", full):
+                print("  DATABASE_URL 기록: %s (600)" % env_file)
+            else:
+                print("  DATABASE_URL 이 이미 있어 두었습니다. 새 값:\n    %s" % full)
     if not env_file.exists():
         write_atomic(env_file, "# %s 운영 설정. git에 올리지 않는다.\n" % name, mode=0o600)
         print("  환경 파일 생성: %s (600)" % env_file)
+
+    if args.deploy and checkout:
+        print()
+        rc = cmd_deploy(argparse.Namespace(name=name, source=str(checkout), no_build=False,
+                                           timeout=180, quiet=False))
+        if rc == 0:
+            print("\n배포 완료: https://%s%s" % (app["domain"], app.get("healthPath", "/")))
+            print("자동 배포를 켜려면 워크플로를 밀어 두세요:")
+            print("  cd %s && git add .github/workflows/deploy.yml"
+                  " && git commit -m 'Deploy via deployctl' && git push" % checkout)
+        return rc
+
+    print("\n다음 순서")
+    steps = []
+    if not checkout:
+        steps.append("소스를 받습니다: %s"
+                     % " ".join(clone_cmd(app["repository"], WORKSPACES / name)))
+    compose_ref = app.get("composeFile", "")
+    compose_hint = (WORKSPACES / name / compose_ref.split(":", 1)[1]
+                    if compose_ref.startswith("source:") else site_dir(name) / compose_ref)
+    steps.append("%s 의 ports 를 \"127.0.0.1:%d:<컨테이너포트>\" 로 맞춥니다."
+                 % (compose_hint, app["port"]))
+    steps.append("앱이 쓸 나머지 시크릿을 %s 에 넣습니다." % env_file)
+    if not runner_path:
+        steps.append("러너를 붙입니다: deployctl runner %s" % name)
+    steps.append("deployctl validate %s" % name)
+    steps.append("deployctl deploy   %s" % name)
+    for i, line in enumerate(steps, 1):
+        print("  %d. %s" % (i, line))
     return 0
 
 
@@ -503,9 +1280,59 @@ def cmd_status(args):
         print("%s" % name)
         print("  도메인 %s (Caddy %s) · HTTPS %s" % (app["domain"], "등록" if served else "미등록", code))
         print("  포트 127.0.0.1:%s · 컨테이너 %d개" % (app["port"], running))
+        state = runner_status(name, app)
+        if state:
+            print("  러너 mac-%s · %s" % (name, state))
         for line in ps.splitlines():
             if line.strip():
                 print("    %s" % line.replace("\t", "  "))
+    return 0
+
+
+def cmd_scaffold(args):
+    name = args.name
+    app = load(name)
+    checkout = Path(args.source) if args.source else WORKSPACES / name
+    if not checkout.exists():
+        raise DeployError("체크아웃이 없습니다: %s" % checkout)
+    made = scaffold(name, app, checkout, force=args.force, attempts=args.attempts)
+    if not made:
+        print("만들 것이 없었습니다.")
+        return 0
+    print("\n검수한 뒤 커밋하세요. 생성물은 초안입니다:")
+    for path in made:
+        print("  %s" % path)
+    print("  deployctl validate %s" % name)
+    return 0
+
+
+def cmd_workflow(args):
+    name = args.name
+    load(name)
+    checkout = Path(args.source) if args.source else WORKSPACES / name
+    if not (checkout / ".git").exists():
+        raise DeployError("git 체크아웃이 아닙니다: %s" % checkout)
+    write_workflow(name, checkout)
+    for path in stale_workflows(checkout):
+        print("  확인 필요: %s 도 self-hosted 러너를 씁니다." % path)
+    print("\n커밋해서 밀면 러너가 배포합니다:")
+    print("  cd %s && git add .github/workflows/deploy.yml && git commit && git push" % checkout)
+    return 0
+
+
+def cmd_runner(args):
+    name = args.name
+    app = load(name)
+    if args.remove:
+        if not args.yes:
+            raise DeployError("러너 등록을 해제합니다. 확인했으면 --yes 를 붙이세요.")
+        path = runner_remove(name, app)
+        print("해제 완료. 디렉터리는 남깁니다: %s" % path)
+        return 0
+    path = runner_install(name, app)
+    print("러너 준비 완료: %s" % path)
+    print("  워크플로의 runs-on 에 이 라벨을 넣으세요:")
+    print("    runs-on: [self-hosted, macOS, ARM64, %s]" % name)
     return 0
 
 
@@ -538,32 +1365,59 @@ def main():
     parser = argparse.ArgumentParser(prog="deployctl", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("init", help="사이트 등록 · 포트 배정 · DB 프로비저닝")
-    p.add_argument("name")
-    p.add_argument("--domain", required=True)
+    p = sub.add_parser("init", help="사이트 등록 · 포트 배정 · DB 프로비저닝 "
+                                    "(인자 없이 실행하면 하나씩 물어본다)")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--domain")
     p.add_argument("--port", type=int, help="생략하면 9000번대에서 자동 배정")
-    p.add_argument("--repo", default="")
-    p.add_argument("--compose", default="source:compose.yaml",
+    p.add_argument("--repo")
+    p.add_argument("--compose",
                    help="source:<파일> 이면 러너 체크아웃 기준, 아니면 ~/srv/<사이트>/ 기준")
-    p.add_argument("--health-path", default="/")
-    p.add_argument("--pool", type=int, default=DEFAULT_POOL, help="DB 커넥션 풀 상한")
+    p.add_argument("--health-path")
+    p.add_argument("--pool", type=int, help="DB 커넥션 풀 상한 (기본 %d)" % DEFAULT_POOL)
     p.add_argument("--max-upload", type=int, help="업로드 상한(MB)")
     p.add_argument("--db", action="store_true", help="전용 DB·유저를 함께 만든다")
+    p.add_argument("--no-clone", action="store_true",
+                   help="저장소를 ~/workspaces 로 받아 오지 않는다")
+    p.add_argument("--runner", action="store_true", default=None,
+                   help="이 저장소 전용 Actions 러너를 등록한다")
+    p.add_argument("--deploy", action="store_true", default=None,
+                   help="등록이 끝나면 바로 배포한다")
+    p.add_argument("--scaffold", action="store_true", default=None,
+                   help="없는 Dockerfile·compose 를 claude 로 만든다")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("validate", help="규칙 위반 검사")
     p.add_argument("name")
-    p.add_argument("--source", help="러너 체크아웃 경로")
+    p.add_argument("--source", help="러너 체크아웃 경로 (생략하면 ~/workspaces/<사이트>)")
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("deploy", help="빌드 · 기동 · Caddy 등록 · HTTPS 확인")
     p.add_argument("name")
-    p.add_argument("--source", help="러너 체크아웃 경로")
+    p.add_argument("--source", help="러너 체크아웃 경로 (생략하면 ~/workspaces/<사이트>)")
     p.add_argument("--no-build", action="store_true")
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--quiet", action="store_true", help="검사 항목을 출력하지 않는다")
     p.set_defaults(func=cmd_deploy)
+
+    p = sub.add_parser("scaffold", help="없는 Dockerfile·compose 를 만든다 (claude + 빌드 검증)")
+    p.add_argument("name")
+    p.add_argument("--source", help="체크아웃 경로 (생략하면 ~/workspaces/<사이트>)")
+    p.add_argument("--attempts", type=int, default=3, help="Dockerfile 빌드 재시도 횟수")
+    p.add_argument("--force", action="store_true", help="이미 있는 파일도 덮어쓴다")
+    p.set_defaults(func=cmd_scaffold)
+
+    p = sub.add_parser("workflow", help="배포 워크플로(.github/workflows/deploy.yml) 생성")
+    p.add_argument("name")
+    p.add_argument("--source", help="체크아웃 경로 (생략하면 ~/workspaces/<사이트>)")
+    p.set_defaults(func=cmd_workflow)
+
+    p = sub.add_parser("runner", help="저장소 전용 Actions 러너 등록·해제 (규칙 8-2)")
+    p.add_argument("name")
+    p.add_argument("--remove", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_runner)
 
     p = sub.add_parser("status", help="컨테이너 · Caddy · HTTPS 상태")
     p.add_argument("name", nargs="?")
