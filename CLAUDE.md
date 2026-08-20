@@ -310,7 +310,11 @@ GitHub의 조직 단위 러너는 Organization/Enterprise 계정에만 있다. �
   ```yaml
   - run: for i in $(seq 30); do docker info >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1
   ```
-- 배포 후 **헬스체크**를 하고, 실패 시 이전 이미지로 롤백한다.
+- 배포 후 **헬스체크**를 하고, 실패 시 이전 이미지로 롤백한다. `deployctl deploy`가
+  빌드 직전 이미지 ID를 기억했다가 HTTPS 확인이 실패하면 태그를 되돌리고 다시 띄운다.
+  **되돌아가는 것은 이미지뿐이다 — 마이그레이션은 그대로 남는다.** 앞으로만 가는
+  마이그레이션(컬럼 추가 등)은 구 이미지가 견디지만, 파괴적 변경은 롤백해도 깨진다.
+  첫 배포는 되돌릴 이미지가 없으므로 롤백하지 않고 실패로 끝난다. 끄려면 `--no-rollback`.
 
 ---
 
@@ -357,10 +361,10 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
 |---|---|
 | `init` | 매니페스트 생성, 포트 자동 배정(9000–9099), `~/workspaces/<사이트>`로 clone, 전용 DB·유저 생성 + 격리 검증, `.env`에 `DATABASE_URL` 기록(600) |
 | `validate` | 사이트명·포트·도메인 중복, 커넥션 여유, DNS, arm64, `127.0.0.1` 바인딩, **게시 포트 == `app.json` 포트**, 전용 Postgres 금지, `dbnet` 참여, **빌드 정의 없는 이미지의 존재 여부** |
-| `deploy` | 검사 → 빌드 → 기동 → Caddy 사이트 등록·reload → HTTPS 폴링 |
+| `deploy` | 배포 대상(커밋·브랜치·미커밋) 표시 → 검사 → 빌드 → 기동 → Caddy 등록·reload → HTTPS 폴링 → 실패 시 롤백 |
 | `status` | 컨테이너·Caddy 등록·HTTPS·커넥션 현황 |
 | `scaffold` | **없는** `Dockerfile`·compose 생성 (Dockerfile은 `claude -p` 초안 → `docker build` 검증, 실패 시 오류 되먹여 재시도) |
-| `workflow` | `.github/workflows/deploy.yml` 생성 (docker 대기 → checkout → deploy, `runs-on`에 사이트 라벨) |
+| `workflow` | `.github/workflows/deploy.yml` 생성 (docker 대기 → checkout → deploy, `runs-on`에 사이트 라벨). **이미 있으면 `--force` 없이는 덮어쓰지 않는다** |
 | `runner` | 저장소 전용 Actions 러너 등록 (private 확인 → 배포본 전개 → 토큰 발급 → LaunchAgent 기동), `--remove`로 해제 |
 | `remove` | 컨테이너 정리 + Caddy 사이트 해제 (DB와 매니페스트는 남긴다) |
 
@@ -387,7 +391,10 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
 3. `.github/workflows/deploy.yml` 생성. 같은 디렉터리의 다른 self-hosted 워크플로가 있으면 알린다
 4. 전용 러너 등록 (규칙 8-2)
 5. 전용 DB·유저 생성 + `.env`에 `DATABASE_URL` 기록
-6. `deploy` — 검사 → 빌드 → 기동 → Caddy 등록 → HTTPS 확인
+6. 배포. 러너가 있으면 **커밋·push해서 러너가 하게 하고**(자동 배포 사슬을 한 번에 검증),
+   실행을 지켜본다. 잡이 뜨지 않으면 전달 실패로 보고 이 자리에서 배포한다.
+   잡이 뜬 뒤 단계에서 죽으면 내용 실패이므로 물러서지 않는다 — 로컬에서 해도 같기 때문이다.
+   `--no-push`면 처음부터 이 자리에서 배포한다.
 
 러너 등록이 실패해도 나머지는 진행하고 `deployctl runner <사이트>`로 다시 하라고 안내한다.
 비대화형에서는 `--runner`·`--deploy`를 붙여야 각 단계를 한다.

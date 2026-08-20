@@ -811,6 +811,173 @@ def scaffold(name, app, checkout, force=False, attempts=3, ask_port=True):
     return made
 
 
+# ── 배포 대상 · 롤백 ────────────────────────────────────────────────────
+
+def describe_source(checkout):
+    """무엇을 배포하는지 두 줄로. git 체크아웃이 아니면 None."""
+    path = Path(checkout)
+    if not (path / ".git").exists():
+        return None
+    head = git_out(path, "log", "-1", "--format=%h %s")
+    if not head:
+        return None
+    branch = git_out(path, "rev-parse", "--abbrev-ref", "HEAD") or "?"
+    upstream = git_out(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if upstream:
+        counts = git_out(path, "rev-list", "--left-right", "--count", "HEAD...@{u}")
+        ahead, behind = (counts.split() + ["0", "0"])[:2]
+        if ahead == "0" and behind == "0":
+            state = "%s 과 동일" % upstream
+        else:
+            parts = []
+            if behind != "0":
+                parts.append("%s 개 뒤" % behind)
+            if ahead != "0":
+                parts.append("%s 개 앞" % ahead)
+            state = "%s 보다 %s (마지막 fetch 기준)" % (upstream, " · ".join(parts))
+    else:
+        state = "upstream 없음"
+    dirty = len([l for l in (git_out(path, "status", "--porcelain") or "").splitlines() if l])
+    return head, "%s · %s · %s" % (branch, state,
+                                   "미커밋 없음" if not dirty else "미커밋 %d개" % dirty)
+
+
+def built_images(services):
+    """이 스택이 직접 빌드하는 이미지 이름들. 롤백 대상은 이것뿐이다."""
+    return sorted({v["image"] for v in services.values() if v.get("image") and v.get("build")})
+
+
+def image_id(image):
+    return run(["docker", "image", "inspect", image, "--format", "{{.Id}}"], check=False)
+
+
+def snapshot_images(images):
+    """빌드 전 이미지 ID를 기억한다. 없던 이미지는 담지 않는다 (되돌릴 곳이 없다)."""
+    return {image: image_id(image) for image in images if image_id(image)}
+
+
+def rollback(base, snapshot):
+    """기억해 둔 이미지로 태그를 되돌리고 다시 띄운다."""
+    if not snapshot:
+        print("     되돌릴 이전 이미지가 없습니다 (첫 배포). 컨테이너를 그대로 둡니다.")
+        return False
+    for image, ident in snapshot.items():
+        print("     %s → %s" % (image, ident[7:19]))
+        run(["docker", "tag", ident, image], check=False)
+    run(base + ["up", "-d", "--no-build", "--force-recreate"], capture=False, check=False)
+    return True
+
+
+# ── push 배포 ───────────────────────────────────────────────────────────
+#
+# 러너가 배포하게 하면 자동 배포 사슬 전체가 실제로 도는지 한 번에 확인된다.
+# 실패는 두 종류다. 잡이 시작조차 못 하면 전달 실패라 로컬 배포로 물러설 수 있고,
+# 시작한 뒤 단계에서 죽었으면 내용 실패라 로컬에서 해도 똑같이 깨진다.
+
+def git_out(checkout, *args):
+    return run(["git"] + list(args), check=False, cwd=str(checkout))
+
+
+def git_dirty(checkout):
+    return bool(git_out(checkout, "status", "--porcelain"))
+
+
+def head_sha(checkout):
+    return git_out(checkout, "rev-parse", "HEAD")
+
+
+def has_remote(checkout):
+    return bool(git_out(checkout, "remote"))
+
+
+def commit_all(checkout, message):
+    run(["git", "add", "-A"], capture=False, cwd=str(checkout))
+    run(["git", "commit", "-m", message], capture=False, cwd=str(checkout))
+
+
+def find_run(checkout, sha):
+    out = git_out(checkout, "rev-parse", "--abbrev-ref", "HEAD")
+    p = subprocess.run(["gh", "run", "list", "--branch", out, "--limit", "10", "--json",
+                        "databaseId,headSha,status,conclusion"],
+                       capture_output=True, text=True, cwd=str(checkout))
+    if p.returncode != 0:
+        return None
+    try:
+        runs = json.loads(p.stdout)
+    except ValueError:
+        return None
+    for r in runs:
+        if r.get("headSha") == sha:
+            return r
+    return None
+
+
+def watch_run(checkout, sha, start_timeout=150, total_timeout=1800):
+    """(결과, 설명). 결과는 not_started / success / failed 중 하나."""
+    deadline = time.time() + total_timeout
+    start_deadline = time.time() + start_timeout
+    started = False
+    run_id = None
+    while time.time() < deadline:
+        info = find_run(checkout, sha)
+        if info:
+            run_id = info["databaseId"]
+            if info["status"] != "queued":
+                if not started:
+                    print("     잡 시작 (run %s)" % run_id)
+                started = True
+            if info["status"] == "completed":
+                if info.get("conclusion") == "success":
+                    return "success", str(run_id)
+                return "failed", failed_steps(checkout, run_id)
+        if not started and time.time() > start_deadline:
+            return "not_started", ("잡이 %d초 안에 시작되지 않았습니다. "
+                                   "라벨이 맞는 러너가 online 인지 보세요." % start_timeout)
+        time.sleep(5)
+    return "failed", "%d초 안에 끝나지 않았습니다 (run %s)" % (total_timeout, run_id)
+
+
+def failed_steps(checkout, run_id):
+    p = subprocess.run(["gh", "run", "view", str(run_id), "--json", "jobs"],
+                       capture_output=True, text=True, cwd=str(checkout))
+    if p.returncode != 0:
+        return "run %s 실패" % run_id
+    try:
+        jobs = json.loads(p.stdout).get("jobs") or []
+    except ValueError:
+        return "run %s 실패" % run_id
+    bad = [st["name"] for j in jobs for st in (j.get("steps") or [])
+           if st.get("conclusion") not in (None, "success", "skipped")]
+    return "실패 단계: %s (run %s)" % (", ".join(bad) or "알 수 없음", run_id)
+
+
+def deploy_by_push(name, app, checkout):
+    """커밋·push 하고 러너의 배포를 지켜본다. (성공 여부, 폴백해도 되는지)."""
+    if not has_remote(checkout):
+        return False, True
+    if git_dirty(checkout):
+        print("  변경을 커밋합니다")
+        commit_all(checkout, "Deploy %s from the Mac mini" % name)
+    sha = head_sha(checkout)
+    print("  push — 러너가 배포합니다")
+    try:
+        run(["git", "push"], capture=False, cwd=str(checkout))
+    except DeployError as exc:
+        print("  push 실패: %s" % str(exc).splitlines()[0])
+        return False, True
+    print("  실행을 기다리는 중")
+    verdict, detail = watch_run(checkout, sha)
+    if verdict == "success":
+        print("  러너 배포 성공 (run %s)" % detail)
+        return True, False
+    if verdict == "not_started":
+        print("  전달 실패: %s" % detail)
+        return False, True          # 코드 문제가 아니므로 로컬 배포로 물러선다
+    print("  배포 실패: %s" % detail)
+    print("  로컬로 다시 해도 같은 결과입니다. 원인을 고친 뒤 다시 미세요.")
+    return False, False
+
+
 # ── 워크플로 ────────────────────────────────────────────────────────────
 
 WORKFLOW_TEMPLATE = """\
@@ -862,12 +1029,17 @@ def default_branch(checkout):
     return head or "main"
 
 
-def write_workflow(name, checkout):
+def write_workflow(name, checkout, force=False):
     """러너에서 도는 배포 워크플로를 만든다. git 이 이전 판을 들고 있어 백업은 남기지 않는다."""
     path = Path(checkout) / ".github" / "workflows" / "deploy.yml"
     text = WORKFLOW_TEMPLATE.format(name=name, branch=default_branch(checkout))
     if path.exists() and path.read_text() == text:
         print("  워크플로: 변동 없음 (%s)" % path)
+        return path, False
+    if path.exists() and not force:
+        # 사람이 넣은 단계(테스트 게이트 같은)를 말없이 지우지 않는다.
+        print("  워크플로: 이미 있습니다 — 건드리지 않습니다 (%s)" % path)
+        print("           덮어쓰려면 deployctl workflow %s --force" % name)
         return path, False
     path.parent.mkdir(parents=True, exist_ok=True)
     verb = "갱신" if path.exists() else "생성"
@@ -1174,13 +1346,28 @@ def cmd_init(args):
 
     if args.deploy and checkout:
         print()
+        local_ok = True
+        if runner_path and args.push is not False:
+            print("[배포] push 해서 러너가 하게 합니다")
+            done, may_fallback = deploy_by_push(name, app, checkout)
+            if done:
+                print("\n배포 완료: https://%s%s" % (app["domain"], app.get("healthPath", "/")))
+                print("이제 %s 에 push할 때마다 자동 배포됩니다." % default_branch(checkout))
+                return 0
+            if not may_fallback:
+                return 1
+            print("  로컬 배포로 물러섭니다")
+        elif runner_path:
+            print("[배포] 여기서 합니다 (--no-push)")
+        else:
+            print("[배포] 러너가 없어 여기서 합니다")
+
         rc = cmd_deploy(argparse.Namespace(name=name, source=str(checkout), no_build=False,
-                                           timeout=180, quiet=False))
+                                           timeout=180, quiet=False, no_rollback=False))
         if rc == 0:
             print("\n배포 완료: https://%s%s" % (app["domain"], app.get("healthPath", "/")))
-            print("자동 배포를 켜려면 워크플로를 밀어 두세요:")
-            print("  cd %s && git add .github/workflows/deploy.yml"
-                  " && git commit -m 'Deploy via deployctl' && git push" % checkout)
+            print("자동 배포는 아직입니다. 검수한 뒤 미세요:")
+            print("  cd %s && git add -A && git commit && git push" % checkout)
         return rc
 
     print("\n다음 순서")
@@ -1212,9 +1399,18 @@ def cmd_validate(args):
 
 def cmd_deploy(args):
     name = args.name
+    source = args.source or str(WORKSPACES / name)
+    described = describe_source(source)
+    if described:
+        print("배포 대상: %s" % described[0])
+        print("           %s" % described[1])
+
     print("[1/5] 검사")
     app = validate(name, args.source, quiet=args.quiet)
     base = compose_args(name, app, args.source)
+    services = (compose_config(name, app, args.source).get("services") or {})
+    # 빌드 직전 이미지를 기억해 둔다. 헬스체크가 실패하면 여기로 되돌린다.
+    snapshot = {} if args.no_rollback else snapshot_images(built_images(services))
 
     if not args.no_build:
         print("[2/5] 이미지 빌드")
@@ -1233,23 +1429,45 @@ def cmd_deploy(args):
 
     print("[5/5] HTTPS 확인")
     url = "https://%s%s" % (app["domain"], app.get("healthPath", "/"))
-    deadline = time.time() + args.timeout
+    ok, last = poll_https(url, args.timeout)
+    if ok:
+        return 0
+
+    print("     실패: %s" % last)
+    if args.no_rollback:
+        raise DeployError("HTTPS 확인이 %d초 안에 끝나지 않았습니다. 마지막 응답: %s"
+                          % (args.timeout, last))
+    print("[롤백] 이전 이미지로 되돌립니다")
+    if not rollback(base, snapshot):
+        raise DeployError("배포가 실패했고 되돌릴 이미지도 없습니다. 마지막 응답: %s" % last)
+    ok, after = poll_https(url, 60)
+    if ok:
+        raise DeployError("새 버전이 응답하지 않아 이전 이미지로 되돌렸습니다. "
+                          "사이트는 살아 있습니다. 실패 응답: %s\n"
+                          "  주의: 마이그레이션은 되돌아가지 않습니다." % last)
+    raise DeployError("배포도 롤백도 응답을 못 받았습니다. 배포 실패: %s / 롤백 후: %s"
+                      % (last, after))
+
+
+def poll_https(url, timeout):
+    """(성공 여부, 마지막 응답). 4xx 도 앱이 살아 있는 것으로 본다."""
+    deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
         try:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=10) as r:
                 print("     %s → HTTP %d" % (url, r.status))
-                return 0
+                return True, "HTTP %d" % r.status
         except urllib.error.HTTPError as e:
             if e.code < 500:
                 print("     %s → HTTP %d" % (url, e.code))
-                return 0
+                return True, "HTTP %d" % e.code
             last = "HTTP %d" % e.code
         except Exception as e:
             last = str(e)
         time.sleep(3)
-    raise DeployError("HTTPS 확인이 %d초 안에 끝나지 않았습니다. 마지막 응답: %s" % (args.timeout, last))
+    return False, last
 
 
 def cmd_status(args):
@@ -1312,7 +1530,7 @@ def cmd_workflow(args):
     checkout = Path(args.source) if args.source else WORKSPACES / name
     if not (checkout / ".git").exists():
         raise DeployError("git 체크아웃이 아닙니다: %s" % checkout)
-    write_workflow(name, checkout)
+    write_workflow(name, checkout, force=args.force)
     for path in stale_workflows(checkout):
         print("  확인 필요: %s 도 self-hosted 러너를 씁니다." % path)
     print("\n커밋해서 밀면 러너가 배포합니다:")
@@ -1385,6 +1603,8 @@ def main():
                    help="등록이 끝나면 바로 배포한다")
     p.add_argument("--scaffold", action="store_true", default=None,
                    help="없는 Dockerfile·compose 를 claude 로 만든다")
+    p.add_argument("--no-push", dest="push", action="store_false", default=None,
+                   help="push 하지 않고 이 자리에서 배포한다")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
 
@@ -1399,6 +1619,8 @@ def main():
     p.add_argument("--no-build", action="store_true")
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--quiet", action="store_true", help="검사 항목을 출력하지 않는다")
+    p.add_argument("--no-rollback", action="store_true",
+                   help="헬스체크가 실패해도 이전 이미지로 되돌리지 않는다")
     p.set_defaults(func=cmd_deploy)
 
     p = sub.add_parser("scaffold", help="없는 Dockerfile·compose 를 만든다 (claude + 빌드 검증)")
@@ -1411,6 +1633,7 @@ def main():
     p = sub.add_parser("workflow", help="배포 워크플로(.github/workflows/deploy.yml) 생성")
     p.add_argument("name")
     p.add_argument("--source", help="체크아웃 경로 (생략하면 ~/workspaces/<사이트>)")
+    p.add_argument("--force", action="store_true", help="이미 있는 워크플로도 덮어쓴다")
     p.set_defaults(func=cmd_workflow)
 
     p = sub.add_parser("runner", help="저장소 전용 Actions 러너 등록·해제 (규칙 8-2)")
