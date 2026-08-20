@@ -244,10 +244,13 @@ colima·runner가 로그인을 기다리는 동안에도 Caddy는 살아 있어�
 
 ```
 ~/workspaces/
-└── myapp/     # (2026-08-19 기준 유일)
+├── initial-settings/        # 이 저장소 (인프라 규칙서 + deployctl)
+└── myapp/
 ```
 
 - 새 프로젝트는 `git clone`으로 이 폴더 아래에 받는다.
+- `deployctl`도 여기서 고친다. `/opt/homebrew/bin/deployctl`이 이 파일을 가리키는 심볼릭 링크라
+  저장하는 즉시 반영된다. 배포 워크플로는 경로 대신 명령 이름으로 부른다.
 - `~/srv/`나 `~/actions-runner/_work/`의 파일을 직접 수정하지 않는다.
   전자는 배포 설정 전용이고, 후자는 배포 때마다 덮어써진다.
 
@@ -305,9 +308,9 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
    특히 `prune --volumes`는 서비스가 내려간 상태에서 실행하면 DB 데이터가 삭제된다.
 2. **사이트 추가는 `deployctl`로 한다** (§11). 위 규칙 대부분을 기계가 검사·수행한다.
    ```bash
-   ./deployctl init <사이트> --domain <도메인> --db     # 포트 배정 + DB + 격리 검증
-   ./deployctl validate <사이트> --source <경로>        # 규칙 위반 검사
-   ./deployctl deploy   <사이트> --source <경로>        # 기동 + Caddy 등록 + HTTPS 확인
+   deployctl init <사이트> --domain <도메인> --db     # 포트 배정 + DB + 격리 검증
+   deployctl validate <사이트> --source <경로>        # 규칙 위반 검사
+   deployctl deploy   <사이트> --source <경로>        # 기동 + Caddy 등록 + HTTPS 확인
    ```
    손으로 할 때만 아래를 직접 확인한다.
    - [ ] 이미지 arm64 확인
@@ -323,7 +326,8 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
 
 ## 11. deployctl — 배포 도구
 
-`./deployctl` (이 저장소 루트). 위 규칙을 사람이 외우는 대신 기계가 검사·수행한다.
+`deployctl` (PATH에 있음 — `/opt/homebrew/bin/deployctl` → `~/workspaces/initial-settings/deployctl` 심볼릭 링크).
+위 규칙을 사람이 외우는 대신 기계가 검사·수행한다.
 표준 라이브러리만 쓰며 **sudo가 필요 없다** (Caddy reload는 관리 API로 한다).
 
 | 명령 | 하는 일 |
