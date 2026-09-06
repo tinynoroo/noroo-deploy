@@ -12,6 +12,7 @@ sudo는 쓰지 않는다. Caddy reload는 관리 API(127.0.0.1:2019)로 한다.
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -31,7 +32,9 @@ WORKSPACES = Path.home() / "workspaces"
 # 규칙 8-1. 개인 계정은 조직 단위 러너를 못 쓰므로 저장소마다 러너를 하나씩 붙인다.
 # 러너는 홈에 흩어지지 않고 이 폴더 아래 사이트명 디렉터리로 모인다.
 RUNNER_BASE = Path.home() / "actions-runner"
-RUNNER_ENV = "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nLANG=C.UTF-8\n"
+RUNNER_ENV = ("PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nLANG=C.UTF-8\n"
+              if platform.system() == "Darwin" else
+              "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nLANG=C.UTF-8\n")
 CADDYFILE = Path("/opt/homebrew/etc/Caddyfile")
 CADDY_SITES = CADDYFILE.parent / "caddy-sites"
 CADDY_ADMIN = "http://127.0.0.1:2019"
@@ -41,6 +44,18 @@ DBNET = "dbnet"
 DEFAULT_POOL = 5
 PORT_RANGE = range(9000, 9100)
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# 규칙 3-1은 "이 맥"(arm64)을 전제로 적혔다. 실제로 지켜야 할 것은 이미지가 이 호스트의
+# 네이티브 아키텍처와 일치하는지이지, arm64 그 자체가 아니다. 호스트가 바뀌어도 맞는 채로
+# 남도록 하드코딩 대신 실행 시점에 판별한다.
+_ARCH_MAP = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+HOST_ARCH = "linux/%s" % _ARCH_MAP.get(platform.machine().lower(), platform.machine().lower())
+
+# actions/runner 배포본과 GitHub 기본 러너 라벨도 macOS/arm64만 전제하지 않는다 (규칙 8-2).
+_RUNNER_OS = {"Darwin": "osx", "Linux": "linux"}.get(platform.system(), platform.system().lower())
+_RUNNER_ARCH = {"amd64": "x64", "arm64": "arm64"}.get(_ARCH_MAP.get(platform.machine().lower(), ""),
+                                                      platform.machine().lower())
+RUNNER_OS_LABEL = {"Darwin": "macOS", "Linux": "Linux"}.get(platform.system(), platform.system())
+RUNNER_ARCH_LABEL = {"x64": "X64", "arm64": "ARM64"}.get(_RUNNER_ARCH, _RUNNER_ARCH.upper())
 # 저장소가 배포 준비됐는지 볼 때 찾는 이름들.
 COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
 
@@ -359,8 +374,9 @@ def validate(name, source=None, quiet=False):
     cfg = compose_config(name, app, source)
     services = cfg.get("services") or {}
 
-    bad = [s for s, v in services.items() if str(v.get("platform", "")).endswith("amd64")]
-    check(results, not bad, "arm64 전용 (규칙 3-1)", "platform 지정: %s" % ", ".join(bad))
+    bad = [s for s, v in services.items() if v.get("platform") and v["platform"] != HOST_ARCH]
+    check(results, not bad, "%s 전용 (규칙 3-1)" % HOST_ARCH,
+          "platform 지정이 호스트와 다름: %s" % ", ".join(bad))
 
     exposed = []
     for svc, v in services.items():
@@ -401,7 +417,7 @@ def validate(name, source=None, quiet=False):
         elif not arch:
             check(results, True, "이미지 %s" % image, "로컬에 없음 — 빌드 후 확인됨")
         else:
-            check(results, arch == "linux/arm64", "이미지 %s = %s" % (image, arch))
+            check(results, arch == HOST_ARCH, "이미지 %s = %s (기대: %s)" % (image, arch, HOST_ARCH))
 
     if not quiet:
         for ok, label, detail in results:
@@ -569,24 +585,30 @@ def gh_json(path, method="GET"):
 
 
 def runner_package():
-    """러너 배포본. 이미 받아 둔 tarball을 재사용하고, 없으면 최신을 내려받는다."""
+    """러너 배포본. 이미 받아 둔 tarball을 재사용하고, 없으면 이 호스트용 최신을 내려받는다."""
     # 배포본 tarball 은 러너들 위 공용 자리에 둔다.
-    local = sorted(RUNNER_BASE.glob("actions-runner-osx-arm64-*.tar.gz"))
+    tag = "%s-%s" % (_RUNNER_OS, _RUNNER_ARCH)
+    local = sorted(RUNNER_BASE.glob("actions-runner-%s-*.tar.gz" % tag))
     if local:
         return local[-1]
     release = gh_json("repos/actions/runner/releases/latest")
     version = release["tag_name"].lstrip("v")
     url = ("https://github.com/actions/runner/releases/download/"
-           "v{v}/actions-runner-osx-arm64-{v}.tar.gz".format(v=version))
-    dest = RUNNER_BASE / ("actions-runner-osx-arm64-%s.tar.gz" % version)
+           "v{v}/actions-runner-{tag}-{v}.tar.gz".format(v=version, tag=tag))
+    dest = RUNNER_BASE / ("actions-runner-%s-%s.tar.gz" % (tag, version))
     dest.parent.mkdir(parents=True, exist_ok=True)
     print("  러너 배포본 내려받는 중: %s" % url)
     run(["curl", "-fsSL", "-o", str(dest), url], capture=False)
     return dest
 
 
+def sudo_prefix():
+    """svc.sh 는 리눅스에서 systemctl 을 직접 부르므로 sudo로 실행돼야 한다. macOS는 필요 없다."""
+    return ["sudo"] if platform.system() == "Linux" else []
+
+
 def runner_install(name, app):
-    """저장소 전용 러너를 등록하고 LaunchAgent로 띄운다."""
+    """저장소 전용 러너를 등록하고 서비스(macOS는 LaunchAgent, 리눅스는 systemd)로 띄운다."""
     slug = repo_slug(app.get("repository"))
     if not gh_ready():
         raise DeployError("gh 로그인이 필요합니다: gh auth login")
@@ -596,7 +618,7 @@ def runner_install(name, app):
     path = runner_dir(name)
     if (path / ".runner").exists():
         print("  러너가 이미 등록돼 있습니다: %s" % path)
-        # 디렉터리를 옮기면 LaunchAgent 는 따라오지 않는다. 서비스만 다시 건다.
+        # 디렉터리를 옮기면 서비스 등록은 따라오지 않는다. 서비스만 다시 건다.
         ensure_service(path)
         return path
 
@@ -606,13 +628,14 @@ def runner_install(name, app):
         print("  배포본 풀기: %s → %s" % (package.name, path))
         run(["tar", "xzf", str(package), "-C", str(path)], capture=False)
 
-    # LaunchAgent는 로그인 셸 환경을 상속하지 않는다. PATH가 없으면 docker를 못 찾는다.
+    # 서비스로 뜬 러너는 로그인 셸 환경을 상속하지 않는다. PATH가 없으면 docker를 못 찾는다.
     write_atomic(path / ".env", RUNNER_ENV)
 
     token = gh_json("repos/%s/actions/runners/registration-token" % slug, "POST")["token"]
-    print("  등록: %s (라벨 %s)" % (slug, name))
+    runner_name = "%s-%s" % (_RUNNER_OS, name)
+    print("  등록: %s (러너 %s, 라벨 %s)" % (slug, runner_name, name))
     run([str(path / "config.sh"), "--url", "https://github.com/%s" % slug,
-         "--token", token, "--name", "mac-%s" % name, "--labels", name,
+         "--token", token, "--name", runner_name, "--labels", name,
          "--work", "_work", "--unattended", "--replace"], capture=False, cwd=str(path))
 
     ensure_service(path)
@@ -620,17 +643,21 @@ def runner_install(name, app):
 
 
 def ensure_service(path):
-    """LaunchAgent 가 이 경로로 걸려 있게 한다. 없으면 설치하고 띄운다."""
+    """LaunchAgent(macOS)/systemd(리눅스) 가 이 경로로 걸려 있게 한다. 없으면 설치하고 띄운다."""
+    sudo = sudo_prefix()
     if (path / ".service").exists():
-        plist = (path / ".service").read_text().strip()
-        agent = Path.home() / "Library" / "LaunchAgents" / plist
-        if agent.exists() and str(path) in agent.read_text():
-            run([str(path / "svc.sh"), "start"], capture=False, check=False, cwd=str(path))
-            print("  서비스: 이미 걸려 있음 (%s)" % plist)
+        svc_name = (path / ".service").read_text().strip()
+        if platform.system() == "Darwin":
+            unit = Path.home() / "Library" / "LaunchAgents" / svc_name
+        else:
+            unit = Path("/etc/systemd/system") / svc_name
+        if unit.exists() and str(path) in unit.read_text():
+            run(sudo + [str(path / "svc.sh"), "start"], capture=False, check=False, cwd=str(path))
+            print("  서비스: 이미 걸려 있음 (%s)" % svc_name)
             return
     print("  서비스 등록·기동")
-    run([str(path / "svc.sh"), "install"], capture=False, cwd=str(path))
-    run([str(path / "svc.sh"), "start"], capture=False, cwd=str(path))
+    run(sudo + [str(path / "svc.sh"), "install"], capture=False, cwd=str(path))
+    run(sudo + [str(path / "svc.sh"), "start"], capture=False, cwd=str(path))
 
 
 def runner_remove(name, app):
@@ -639,8 +666,9 @@ def runner_remove(name, app):
     if not path.exists():
         raise DeployError("러너가 없습니다: %s" % path)
     if (path / ".service").exists():
-        run([str(path / "svc.sh"), "stop"], capture=False, check=False, cwd=str(path))
-        run([str(path / "svc.sh"), "uninstall"], capture=False, check=False, cwd=str(path))
+        sudo = sudo_prefix()
+        run(sudo + [str(path / "svc.sh"), "stop"], capture=False, check=False, cwd=str(path))
+        run(sudo + [str(path / "svc.sh"), "uninstall"], capture=False, check=False, cwd=str(path))
     if (path / ".runner").exists():
         token = gh_json("repos/%s/actions/runners/remove-token" % slug, "POST")["token"]
         run([str(path / "config.sh"), "remove", "--token", token],
@@ -657,7 +685,7 @@ def runner_status(name, app):
         runners = gh_json("repos/%s/actions/runners" % slug)["runners"]
     except DeployError:
         return "등록됨 (상태 확인 실패)"
-    mine = [r for r in runners if r["name"] == "mac-%s" % name]
+    mine = [r for r in runners if r["name"] == "%s-%s" % (_RUNNER_OS, name)]
     if not mine:
         return "로컬에만 있음 (저장소에서 사라짐)"
     return mine[0]["status"]
@@ -672,7 +700,7 @@ DOCKERFILE_PROMPT = """\
 이 저장소를 빌드해 실행하는 Dockerfile 하나를 만들어라. 저장소를 먼저 읽고 판단해라.
 
 지켜야 할 것:
-- 베이스 이미지는 linux/arm64 를 지원하는 멀티아치 태그를 쓴다. amd64 고정 태그 금지.
+- 베이스 이미지는 {host_arch} 를 지원하는 멀티아치 태그를 쓴다. 다른 아키텍처로 고정된 태그 금지.
 - Dockerfile 안에 --platform 을 적지 않는다.
 - 최종 실행은 non-root 사용자로 한다.
 - 비밀값을 이미지에 굽지 않는다. 런타임 환경 변수로 받는다.
@@ -742,7 +770,7 @@ def generate_dockerfile(name, checkout, attempts=3):
     try:
         for attempt in range(1, attempts + 1):
             print("  Dockerfile 초안 생성 (%d/%d) — 저장소를 읽는 중" % (attempt, attempts))
-            text = run(["claude", "-p", DOCKERFILE_PROMPT.format(feedback=feedback),
+            text = run(["claude", "-p", DOCKERFILE_PROMPT.format(feedback=feedback, host_arch=HOST_ARCH),
                         "--allowedTools", "Read,Glob,Grep"], cwd=str(checkout))
             text = strip_fences(text)
             if "FROM" not in text:
@@ -1005,12 +1033,12 @@ concurrency:
 jobs:
   deploy:
     name: Build and deploy {name}
-    # 사이트명 라벨로 이 맥의 전용 러너를 특정한다 (규칙 8-2).
-    runs-on: [self-hosted, macOS, ARM64, {name}]
+    # 사이트명 라벨로 이 호스트의 전용 러너를 특정한다 (규칙 8-2).
+    runs-on: [self-hosted, {os_label}, {arch_label}, {name}]
     timeout-minutes: 30
 
     steps:
-      # 재부팅 직후 러너가 colima(도커 VM)보다 먼저 뜰 수 있다.
+      # 재부팅 직후 러너가 도커 데몬보다 먼저 뜰 수 있다.
       - name: Wait for docker daemon
         run: |
           for _ in $(seq 60); do
@@ -1038,7 +1066,8 @@ def default_branch(checkout):
 def write_workflow(name, checkout, force=False):
     """러너에서 도는 배포 워크플로를 만든다. git 이 이전 판을 들고 있어 백업은 남기지 않는다."""
     path = Path(checkout) / ".github" / "workflows" / "deploy.yml"
-    text = WORKFLOW_TEMPLATE.format(name=name, branch=default_branch(checkout))
+    text = WORKFLOW_TEMPLATE.format(name=name, branch=default_branch(checkout),
+                                    os_label=RUNNER_OS_LABEL, arch_label=RUNNER_ARCH_LABEL)
     if path.exists() and path.read_text() == text:
         print("  워크플로: 변동 없음 (%s)" % path)
         return path, False
@@ -1410,7 +1439,7 @@ def init_steps(args, app, checkout, undo):
         try:
             runner_path = runner_install(name, app)
             if fresh_runner:
-                undo.append(("러너 mac-%s" % name, lambda: runner_remove(name, app)))
+                undo.append(("러너 %s-%s" % (_RUNNER_OS, name), lambda: runner_remove(name, app)))
         except DeployError as exc:
             print("  러너 등록 실패: %s" % exc)
             print("  나중에 다시: deployctl runner %s" % name)
@@ -1589,7 +1618,7 @@ def cmd_status(args):
         print("  포트 127.0.0.1:%s · 컨테이너 %d개" % (app["port"], running))
         state = runner_status(name, app)
         if state:
-            print("  러너 mac-%s · %s" % (name, state))
+            print("  러너 %s-%s · %s" % (_RUNNER_OS, name, state))
         for line in ps.splitlines():
             if line.strip():
                 print("    %s" % line.replace("\t", "  "))
@@ -1639,7 +1668,7 @@ def cmd_runner(args):
     path = runner_install(name, app)
     print("러너 준비 완료: %s" % path)
     print("  워크플로의 runs-on 에 이 라벨을 넣으세요:")
-    print("    runs-on: [self-hosted, macOS, ARM64, %s]" % name)
+    print("    runs-on: [self-hosted, %s, %s, %s]" % (RUNNER_OS_LABEL, RUNNER_ARCH_LABEL, name))
     return 0
 
 
