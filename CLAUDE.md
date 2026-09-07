@@ -278,6 +278,31 @@ sudo install -o root -g caddy -m 664 <Caddyfile 사본> /etc/caddy/Caddyfile   #
 - 변경 전 `caddy validate --config /opt/homebrew/etc/Caddyfile`로 검증한다.
 - 인증서 실험 시에는 `acme_ca` 스테이징 URL을 쓴다 (Let's Encrypt rate limit 회피).
 
+### 6-3. 로그 파일 소유자 — validate가 만들어 둔 파일을 데몬이 못 여는 문제
+
+> **규칙 6-3.** `/var/log/caddy`도 `deploy`가 쓸 수 있어야 한다 (그룹 `caddy`, 775).
+> 그래도 사이트를 새로 추가할 때마다 로그 파일 소유자 문제가 **재발할 수 있다** — 아래를
+> 알고 있을 것.
+
+`caddy validate`는 config에 적힌 로그 writer를 실제로 열어서 검증한다. **파일이 없으면
+그 자리에서 만든다.** 문제는 `validate`가 `deploy`로 도는 반면 Caddy 데몬 자신은 별도의
+시스템 유저 `caddy`로 돈다는 것 — `validate`가 먼저 실행되면 `deploy:deploy 0600`(소유자
+전용) 로그 파일이 생기고, 그 다음 `reload`가 데몬에게 같은 파일을 열라고 시키면 데몬이
+**그 파일의 소유자가 아니라서** permission denied가 난다. 증상이 "Caddyfile 권한
+문제"처럼 보이지만 실제로는 로그 **파일** 하나의 소유자 문제라 헷갈리기 쉽다.
+
+`deployctl`은 `caddy_reload()`에서 `validate`와 `reload` 사이에 `fix_caddy_log_owner()`를
+불러 `/var/log/caddy` 아래 `caddy` 소유가 아닌 파일을 찾아 `sudo install -o caddy -g caddy
+-m 660`으로 되돌린다(`deployctl` 안의 `sudo` 사용은 이것과 §8의 러너 서비스뿐이다).
+손으로 사이트를 추가하거나 이 로직이 없던 옛 버전으로 되돌아갔다면, `reload`가
+`permission denied`로 실패할 때 `/var/log/caddy/<도메인>.log`의 소유자부터 확인한다.
+
+이 문제는 애초에 로그 경로를 `/opt/homebrew` 셔밈이 아니라 **실제 경로**
+(`/var/log/caddy`, `CADDY_LOG_DIR` 상수)로 직접 가리키게 한 것과는 별개다 — 심볼릭 링크
+자체는 문제가 아니었다(Caddy는 `caddy.service`의 `ProtectSystem=full` 샌드박스 안에서
+돌기 때문에, 데몬이 여는 경로는 그 데몬이 실제로 접근 권한을 가진 경로를 곧이곧대로
+써주는 쪽이 안전하다 — 그래서 로그 경로만 셔밈을 거치지 않는다).
+
 ---
 
 ## 7. 디렉터리 구조
@@ -350,10 +375,15 @@ GitHub의 조직 단위 러너는 Organization/Enterprise 계정에만 있다. �
 - 배포본 tarball은 위 공용 자리의 것을 재사용하고, 없으면 이 호스트(`linux-x64`)용 최신을
   내려받는다.
 - 서비스는 `systemd`(시스템 유닛, `/etc/systemd/system/`)로 등록된다. **리눅스의
-  `svc.sh install/start/stop/uninstall`은 내부에서 `systemctl`을 직접 부르므로 반드시
-  `sudo`로 실행돼야 한다** (macOS는 사용자 LaunchAgent라 sudo가 필요 없었지만, 리눅스는
-  다르다). `deployctl`은 `systemctl`이 NOPASSWD sudo 목록에 있어 이 호출을 무인으로 한다
-  (`sudo_prefix()`, `deployctl:607`).
+  `svc.sh install/start/stop/uninstall`은 자기 자신이 `sudo`로 실행되고 있는지부터
+  검사한다** (macOS는 사용자 LaunchAgent라 필요 없었지만, 리눅스는 다르다). 처음엔
+  `sudo svc.sh ...`로 되겠거니 했는데 실패했다 — **sudoers NOPASSWD 목록은 `systemctl`
+  같은 개별 명령 단위로 걸려 있지, `svc.sh`라는 스크립트를 통째로 sudo 실행하는 건
+  내부에서 그 명령들을 부르더라도 별개로 취급돼 일반 sudo(비밀번호 필요)로 떨어진다.**
+  그래서 `deployctl`은 `svc.sh install`이 실제로 하는 일(유닛 파일 렌더링해 배치 →
+  `daemon-reload` → `runsvc.sh` 복사 → `enable`)을 `install`/`systemctl`만으로 그대로
+  재현한다 — sudoers를 넓히지 않고 이미 있는 권한만으로 끝낸다
+  (`linux_service_install/start/stop/uninstall`, `deployctl:612` 부근).
 - 디렉터리를 옮기면 서비스 등록은 따라오지 않는다. `deployctl runner <사이트>`가
   등록이 살아 있는지 보고 서비스만 다시 건다.
 - 워크플로의 `runs-on`에 **사이트명 라벨**을 넣어 러너를 특정한다.
@@ -377,14 +407,20 @@ GitHub의 조직 단위 러너는 Organization/Enterprise 계정에만 있다. �
   마이그레이션(컬럼 추가 등)은 구 이미지가 견디지만, 파괴적 변경은 롤백해도 깨진다.
   첫 배포는 되돌릴 이미지가 없으므로 롤백하지 않고 실패로 끝난다. 끄려면 `--no-rollback`.
 
-**알려진 부채 (2026-09-07 기준)**: 현재 유일하게 운영 중인 사이트 `myapp`
-(`corps.example.com`, 포트 9030)은 위 규칙이 자리잡기 전에 손으로 설정된 것이라 아직
-따르지 않는다 — 러너가 `~/actions-runner/myapp/`이 아니라
-`~/actions-runner/` 바로 아래에 있고, 이름도 `linux-myapp`이 아니라
-`deploy-myapp`이며, 자체 `.github/workflows/deploy.yml`로
-(`deployctl`을 거치지 않고) `sudo docker compose`로 직접 배포한다. `~/srv/`에도
-이 사이트의 `app.json`이 없어 `deployctl`의 장부에 잡히지 않는다. 손대려면 먼저
-사용자에게 확인받는다 — 지금은 정상 동작 중인 운영 사이트다.
+**`myapp` 편입 완료 (2026-09-07)**: 처음엔 위 규칙이 자리잡기 전에 손으로
+설정돼 있었지만(러너가 `~/actions-runner/` 바로 아래, 자체 워크플로로 `rsync`+
+`sudo docker compose` 직접 실행), 지금은 규칙대로 편입됐다:
+- `~/srv/myapp/app.json` 매니페스트 생성, `.env`도 `~/workspaces/`에서
+  이쪽으로 옮김 (규칙 7-2).
+- 러너를 `~/actions-runner/myapp/`에 `linux-myapp`이라는
+  이름으로 새로 등록 → 온라인 확인 → 예전 러너(`deploy-myapp`, 옛 위치)는
+  서비스 정지·GitHub 등록 해제·디렉터리 정리까지 끝냄. 한 사이트에 러너 하나만 남는다.
+- 워크플로의 `Sync source to deploy directory`/`Deploy`/`Health check` 세 단계를
+  `deployctl deploy myapp --source "$GITHUB_WORKSPACE"` 한 줄로 교체.
+  배포 전 테스트 게이트(`Run tests`)는 `deployctl`이 모르는 단계라 손으로 그대로 남겼다 —
+  워크플로를 다시 만들 때 `deployctl workflow --force`를 쓰면 이 단계가 날아가니 주의.
+- 실제 push → 새 러너 → `deployctl deploy` → Caddy 등록 → HTTPS 200까지 끝까지 검증됨.
+  이 과정에서 §6-3(로그 파일 소유자)과 러너 서비스 sudo 문제(§8 위)를 실제로 겪고 고쳤다.
 
 ---
 
@@ -432,8 +468,11 @@ systemctl is-enabled docker caddy   # 둘 다 enabled 여야 함
 그대로 실행하는 한 줄 래퍼. §7-1 참고).
 위 규칙을 사람이 외우는 대신 기계가 검사·수행한다. 표준 라이브러리만 쓴다.
 Caddy·DB 작업엔 **sudo가 필요 없다**(Caddy reload는 관리 API로, 파일 쓰기 권한은 §6-2의
-그룹 소유로 미리 확보해 뒀다). **러너 서비스 등록만 리눅스에서 예외적으로 sudo를 쓴다**
-(§8, `systemctl`이 NOPASSWD라 무인으로 된다).
+그룹 소유로 미리 확보해 뒀다) — 단 로그 파일 소유자를 되돌리는 한 곳(§6-3)과 러너 서비스
+등록(§8)만 리눅스에서 예외적으로 `sudo`를 쓴다. 둘 다 sudoers NOPASSWD 화이트리스트
+(`install`·`systemctl` 등, 2절)에 있는 명령만 그대로 호출해서 무인으로 된다 — 목록에
+없는 명령(`svc.sh` 같은 스크립트 자체)은 sudo로 못 부르니, 그 명령이 실제로 하는 일을
+화이트리스트 명령만으로 재현하는 쪽으로 푼다(§8의 `linux_service_*` 함수들이 그 예).
 
 | 명령 | 하는 일 |
 |---|---|
