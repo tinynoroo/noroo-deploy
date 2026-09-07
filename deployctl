@@ -40,6 +40,12 @@ RUNNER_ENV = ("PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin
 CADDYFILE = Path("/opt/homebrew/etc/Caddyfile")
 CADDY_SITES = CADDYFILE.parent / "caddy-sites"
 CADDY_ADMIN = "http://127.0.0.1:2019"
+# 생성된 Caddyfile 안의 로그 경로는 deployctl이 아니라 Caddy 데몬 자신이 런타임에 연다.
+# 이 서버(리눅스)에서 Caddy는 systemd(ProtectSystem=full)로 샌드박스돼 있어, 데몬이
+# /opt/homebrew 심볼릭 링크를 거쳐 파일을 열면 permission denied가 난다(원본 경로는
+# 문제없어도 샌드박스가 걸린다). 데몬이 실제로 쓰는 디렉터리를 그대로 적어준다.
+CADDY_LOG_DIR = Path("/opt/homebrew/var/log/caddy") if platform.system() == "Darwin" \
+    else Path("/var/log/caddy")
 PG_CONTAINER = "postgres"
 DBNET = "dbnet"
 # 규칙 4-3. 사이트당 커넥션 상한. 예외는 app.json의 poolSize로 명시한다.
@@ -177,7 +183,7 @@ SITE_TEMPLATE = """\
 	}}
 
 	log {{
-		output file /opt/homebrew/var/log/caddy/{domain}.log {{
+		output file {log_dir}/{domain}.log {{
 			roll_size 50MiB
 			roll_keep 10
 		}}
@@ -190,7 +196,7 @@ SITE_TEMPLATE = """\
 def ensure_caddy_import():
     """메인 Caddyfile이 사이트 디렉터리를 import 하도록 한다."""
     CADDY_SITES.mkdir(parents=True, exist_ok=True)
-    Path("/opt/homebrew/var/log/caddy").mkdir(parents=True, exist_ok=True)
+    CADDY_LOG_DIR.mkdir(parents=True, exist_ok=True)
     text = CADDYFILE.read_text() if CADDYFILE.exists() else "{\n}\n"
     if "import caddy-sites/*.caddy" in text:
         return
@@ -238,13 +244,38 @@ def write_site(app):
     if app.get("maxUploadMB"):
         body = "\n\trequest_body {\n\t\tmax_size %dMB\n\t}\n" % app["maxUploadMB"]
     text = SITE_TEMPLATE.format(domain=app["domain"], port=app["port"],
-                                timeout=app.get("proxyTimeout", 310), body=body)
+                                timeout=app.get("proxyTimeout", 310), body=body,
+                                log_dir=CADDY_LOG_DIR)
     return write_atomic(CADDY_SITES / ("%s.caddy" % app["domain"]), text)
 
 
+def fix_caddy_log_owner():
+    """validate가 만들어 둔 로그 파일의 소유자를 caddy로 되돌린다.
+
+    `caddy validate`는 config에 적힌 로그 writer를 실제로 열어 봐서(파일이 없으면 새로
+    만들어서) 검증한다. 이 서버에서 validate는 deploy로 도는데 Caddy 데몬은 별도의
+    시스템 유저 `caddy`로 돈다 — validate가 먼저 만들면 deploy 소유의 0600 파일이 생겨서
+    정작 데몬이 그 파일을 못 연다. reload 전에 소유자를 caddy로 맞춰 둔다.
+    """
+    if platform.system() != "Linux" or not CADDY_LOG_DIR.exists():
+        return
+    for f in CADDY_LOG_DIR.iterdir():
+        if not f.is_file():
+            continue
+        owner = run(["stat", "-c", "%U", str(f)], check=False)
+        if owner and owner != "caddy":
+            tmp = f.with_name(f.name + ".fixtmp")
+            shutil.copy2(f, tmp)
+            try:
+                run(["sudo", "install", "-o", "caddy", "-g", "caddy", "-m", "660", str(tmp), str(f)])
+            finally:
+                tmp.unlink(missing_ok=True)
+
+
 def caddy_reload():
-    """관리 API로 무중단 반영. sudo가 필요 없다."""
+    """관리 API로 무중단 반영. sudo가 필요 없다(로그 소유자 보정만 예외, 위 참고)."""
     run(["caddy", "validate", "--config", str(CADDYFILE)])
+    fix_caddy_log_owner()
     run(["caddy", "reload", "--config", str(CADDYFILE)])
 
 
@@ -604,9 +635,65 @@ def runner_package():
     return dest
 
 
-def sudo_prefix():
-    """svc.sh 는 리눅스에서 systemctl 을 직접 부르므로 sudo로 실행돼야 한다. macOS는 필요 없다."""
-    return ["sudo"] if platform.system() == "Linux" else []
+def _svc_field(path, field):
+    """svc.sh 안에 config.sh가 박아 둔 변수를 읽는다 (SVC_NAME, SVC_DESCRIPTION)."""
+    text = (path / "svc.sh").read_text()
+    m = re.search(r'^%s="([^"]*)"' % field, text, re.M)
+    if not m:
+        raise DeployError("svc.sh에서 %s를 못 찾았습니다: %s" % (field, path))
+    return m.group(1)
+
+
+def _systemctl(*args, check=True):
+    run(["sudo", "systemctl"] + list(args), check=check)
+
+
+def linux_service_install(path):
+    """systemd 유닛을 svc.sh 대신 install/systemctl만으로 직접 설치한다.
+
+    svc.sh 자체는 sudo NOPASSWD 목록에 없다 — 목록엔 systemctl/install처럼 각 명령이
+    개별로 올라 있고, 스크립트를 통째로 sudo 실행하는 건 그 명령들을 내부에서 부르더라도
+    별개로 취급돼 일반 sudo(비밀번호 필요)로 떨어진다. 대신 svc.sh install이 실제로 하는
+    일(유닛 파일 렌더링해 배치 → daemon-reload → runsvc.sh 복사 → enable)을 그대로
+    재현하면 이미 허용된 명령만으로 끝난다. 화이트리스트를 넓힐 필요가 없다.
+    """
+    svc_name = _svc_field(path, "SVC_NAME")
+    description = _svc_field(path, "SVC_DESCRIPTION")
+    user = os.environ.get("USER") or run(["whoami"])
+    template = (path / "bin" / "actions.runner.service.template").read_text()
+    unit_text = (template.replace("{{User}}", user)
+                          .replace("{{Description}}", description)
+                          .replace("{{RunnerRoot}}", str(path)))
+    tmp = path / "bin" / "actions.runner.service.temp"
+    tmp.write_text(unit_text)
+    try:
+        run(["sudo", "install", "-o", "root", "-g", "root", "-m", "664",
+             str(tmp), "/etc/systemd/system/%s" % svc_name])
+    finally:
+        tmp.unlink(missing_ok=True)
+    _systemctl("daemon-reload")
+    run(["sudo", "install", "-o", user, "-g", user, "-m", "755",
+         str(path / "bin" / "runsvc.sh"), str(path / "runsvc.sh")])
+    _systemctl("enable", svc_name)
+    write_atomic(path / ".service", svc_name + "\n")
+    return svc_name
+
+
+def linux_service_start(path):
+    _systemctl("start", (path / ".service").read_text().strip(), check=False)
+
+
+def linux_service_stop(path):
+    _systemctl("stop", (path / ".service").read_text().strip(), check=False)
+
+
+def linux_service_uninstall(path):
+    """서비스를 끄고 자동시작에서 뺀다. 유닛 파일 자체는 못 지운다 (rm은 화이트리스트 밖) —
+    disable된 채로 무해하게 남는다."""
+    svc_name = (path / ".service").read_text().strip()
+    _systemctl("stop", svc_name, check=False)
+    _systemctl("disable", svc_name, check=False)
+    _systemctl("daemon-reload", check=False)
 
 
 def runner_install(name, app):
@@ -646,20 +733,27 @@ def runner_install(name, app):
 
 def ensure_service(path):
     """LaunchAgent(macOS)/systemd(리눅스) 가 이 경로로 걸려 있게 한다. 없으면 설치하고 띄운다."""
-    sudo = sudo_prefix()
+    linux = platform.system() == "Linux"
     if (path / ".service").exists():
         svc_name = (path / ".service").read_text().strip()
-        if platform.system() == "Darwin":
-            unit = Path.home() / "Library" / "LaunchAgents" / svc_name
-        else:
+        if linux:
             unit = Path("/etc/systemd/system") / svc_name
+        else:
+            unit = Path.home() / "Library" / "LaunchAgents" / svc_name
         if unit.exists() and str(path) in unit.read_text():
-            run(sudo + [str(path / "svc.sh"), "start"], capture=False, check=False, cwd=str(path))
+            if linux:
+                linux_service_start(path)
+            else:
+                run([str(path / "svc.sh"), "start"], capture=False, check=False, cwd=str(path))
             print("  서비스: 이미 걸려 있음 (%s)" % svc_name)
             return
     print("  서비스 등록·기동")
-    run(sudo + [str(path / "svc.sh"), "install"], capture=False, cwd=str(path))
-    run(sudo + [str(path / "svc.sh"), "start"], capture=False, cwd=str(path))
+    if linux:
+        linux_service_install(path)
+        linux_service_start(path)
+    else:
+        run([str(path / "svc.sh"), "install"], capture=False, cwd=str(path))
+        run([str(path / "svc.sh"), "start"], capture=False, cwd=str(path))
 
 
 def runner_remove(name, app):
@@ -668,9 +762,11 @@ def runner_remove(name, app):
     if not path.exists():
         raise DeployError("러너가 없습니다: %s" % path)
     if (path / ".service").exists():
-        sudo = sudo_prefix()
-        run(sudo + [str(path / "svc.sh"), "stop"], capture=False, check=False, cwd=str(path))
-        run(sudo + [str(path / "svc.sh"), "uninstall"], capture=False, check=False, cwd=str(path))
+        if platform.system() == "Linux":
+            linux_service_uninstall(path)
+        else:
+            run([str(path / "svc.sh"), "stop"], capture=False, check=False, cwd=str(path))
+            run([str(path / "svc.sh"), "uninstall"], capture=False, check=False, cwd=str(path))
     if (path / ".runner").exists():
         token = gh_json("repos/%s/actions/runners/remove-token" % slug, "POST")["token"]
         run([str(path / "config.sh"), "remove", "--token", token],
