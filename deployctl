@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""deployctl — Mac mini 다중 사이트 호스팅 서버의 배포 도구.
+"""deployctl — 다중 사이트 호스팅 서버의 배포 도구.
 
 CLAUDE.md의 규칙을 사람이 외우는 대신 기계가 검사하고 수행한다.
 사이트 하나를 올리는 데 필요한 일곱 가지를 담당한다.
@@ -7,7 +7,9 @@ CLAUDE.md의 규칙을 사람이 외우는 대신 기계가 검사하고 수행�
     포트 배정 · DB 프로비저닝 · 컨테이너 기동 · Caddy 사이트 등록 · 인증서 · 검증 · 정리
 
 전제: 공유 Postgres(`~/srv/postgres`)와 Caddy가 이미 떠 있어야 한다.
-sudo는 쓰지 않는다. Caddy reload는 관리 API(127.0.0.1:2019)로 한다.
+호스트 아키텍처/OS는 실행 시점에 자동판별한다 (HOST_ARCH 등, 특정 하드웨어를 전제하지 않음).
+Caddy·DB 작업은 sudo를 쓰지 않는다 (reload는 관리 API로, 권한은 그룹 소유로 확보).
+러너 서비스 등록은 리눅스에서 sudo가 필요하다 (systemd 특성상 svc.sh 자체 요구사항).
 """
 import argparse
 import json

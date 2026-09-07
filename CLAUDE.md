@@ -1,69 +1,72 @@
 # 인프라 규칙서
 
-이 저장소는 **Mac mini를 다중 사이트 호스팅 서버로 운영**하기 위한 설정을 관리한다.
+이 저장소는 **이 서버를 다중 사이트 호스팅 서버로 운영**하기 위한 설정을 관리한다.
 Claude Code는 이 폴더에서 서버 구성 작업을 수행하며, 아래 규칙을 **위반해서는 안 된다**.
 
-상세 셋업 절차는 [mac-server-setup.md](mac-server-setup.md) 참조. 이 문서는 그 중 **강제 규칙**만 추린 것이다.
+상세 셋업 절차는 [mac-server-setup.md](mac-server-setup.md) 참조 — **단, 그 문서는 예전 macOS
+서버를 전제로 쓰였고 지금은 갱신되지 않았다.** 이 문서(CLAUDE.md)가 실제 서버와 어긋나면
+이쪽을 따른다.
 
 ---
 
 ## 1. 하드웨어 / 플랫폼 (고정 전제)
 
+> 이 서버는 원래 macOS(Mac mini, arm64) 전제로 설계된 도구(`deployctl`)와 문서 위에서
+> 운영된다. 2026-09-06 작업으로 도구 쪽을 이 플랫폼에 맞게 고쳤고(§11 참고), 하드웨어
+> 아키텍처만큼은 소프트웨어로 바꿀 수 없어 `deployctl`이 **실행 시점에 자동판별**하도록
+> 했다. 아래 규칙의 "amd64"라는 표현은 이 서버가 x86_64이기 때문이며, 호스트가 바뀌면
+> 도구는 따라가지만 이 문서는 그렇지 않으니 실제 하드웨어가 바뀌면 1절부터 다시 써야 한다.
+
 ---
 
-## 2. 설치된 스택 (2026-08-19 기준)
+## 2. 설치된 스택 (2026-09-07 기준)
 
 | 소프트웨어 | 버전 | 설치 방식 | 상태 |
 |---|---|---|---|
-| Caddy | 2.11.4 | `brew install caddy` | 설치됨 (미기동) |
-| colima | 0.10.3 | `brew install colima` | 실행 중, `brew services` 자동 시작 |
-| Docker CLI | 29.7.2 | `brew install docker` | — |
-| Docker Engine | 29.5.2 | colima VM 내부 | 실행 중 |
-| Docker Compose | 5.5.0 | `brew install docker-compose` | — |
-| PostgreSQL | 17.11-alpine | `~/srv/postgres` compose | **실행 중** (healthy, arm64) |
+| Docker Engine | 29.8.0 | `apt` (네이티브, VM 불필요) | 실행 중 (`docker.service`, enabled) |
+| Docker Compose | v5.5.1 | Docker CLI 플러그인 | — |
+| Caddy | v2.11.4 | `apt` (네이티브) | 실행 중 (`caddy.service`, enabled) |
+| PostgreSQL | 17.11-alpine | `~/srv/postgres` compose (컨테이너) | **실행 중** (healthy, amd64, 슈퍼유저 `postgres`) |
 
-**colima VM 설정** (`~/.colima/default/colima.yaml`)
-
-```yaml
-cpu: 8
-memory: 16
-disk: 100
-vmType: vz
-rosetta: true
-```
-
-- Docker Desktop / OrbStack은 **사용하지 않는다.** 재도입 금지.
-- compose 플러그인 경로가 `~/.docker/config.json`의 `cliPluginsExtraDirs`에 등록되어 있다. 지우지 말 것.
-- 자원 변경은 `colima stop && colima start --cpu N --memory N --disk 100 --vm-type vz --vz-rosetta`.
-  디스크는 **늘릴 수만 있고 줄일 수 없다.**
+- **colima는 없다.** 리눅스는 컨테이너를 네이티브로 돌리므로 macOS처럼 VM이 필요 없다.
+  Docker Desktop / OrbStack도 쓰지 않는다 — 애초에 필요 없다.
+- Docker·Caddy 모두 `systemd`가 관리하는 **시스템 서비스**다(사용자 서비스 아님). 부팅 시
+  로그인 없이 자동 기동된다(§9).
+- `deploy`는 `docker` 그룹과 `caddy` 그룹 소속이다(후자는 2026-09-06에 추가, §6 참고).
+  **그룹 변경은 새 로그인/새 프로세스부터 반영된다** — 이미 떠 있는 셸에서는 안 보인다.
 
 ---
 
-## 3. 이미지 아키텍처 — arm64 전용
+## 3. 이미지 아키텍처 — amd64 (x86_64) 전용
 
-> **규칙 3-1.** 모든 컨테이너 이미지는 **`linux/arm64`** 여야 한다.
+> **규칙 3-1.** 모든 컨테이너 이미지는 이 서버의 네이티브 아키텍처(**`linux/amd64`**)여야
+> 한다.
 
-- 이미지 선택 시 arm64 지원 여부를 **먼저 확인**한다. 미지원이면 그 이미지를 쓰지 말고 대안을 찾는다.
-- `Dockerfile` 베이스 이미지는 멀티아치 태그를 쓴다. 아키텍처 고정 태그(`amd64-*`) 금지.
-- compose에 `platform: linux/amd64`를 **적지 않는다.**
-- 빌드는 이 맥에서 수행하므로 별도 플래그 없이 arm64가 된다. `--platform` 지정 불필요.
-
-**Rosetta에 대하여** — VM에 `rosetta: true`가 켜져 있어 amd64 이미지도 실행은 된다.
-코어 수 제한은 없으나(8코어 정상 사용) **명령어 처리 속도가 약 2.5배 느리다.**
-이는 arm64 이미지가 정말 존재하지 않을 때의 **최후 수단**이며, 사용 시 그 사유를 주석으로 남긴다.
+- 이미지 선택 시 amd64 지원 여부를 **먼저 확인**한다. 미지원이면 그 이미지를 쓰지 말고
+  대안을 찾는다.
+- `Dockerfile` 베이스 이미지는 멀티아치 태그를 쓴다. 다른 아키텍처로 고정된 태그(`arm64-*`
+  등) 금지.
+- compose에 `platform:`을 이 서버와 다른 값으로 **적지 않는다.**
+- 빌드는 이 서버에서 수행하므로 별도 플래그 없이 amd64가 된다. `--platform` 지정 불필요.
+- 에뮬레이션(Rosetta에 해당하는 것)은 **설정돼 있지 않다.** arm64 전용 이미지밖에 없는
+  소프트웨어는 이 서버에서 못 돌린다 — amd64 대안을 찾거나 포기한다.
 
 확인 명령:
 ```bash
-docker image inspect <image> --format '{{.Os}}/{{.Architecture}}'   # linux/arm64 이어야 함
+docker image inspect <image> --format '{{.Os}}/{{.Architecture}}'   # linux/amd64 이어야 함
 docker buildx imagetools inspect <image>                            # 원격 이미지의 지원 아키텍처
 ```
+
+`deployctl`은 이 값을 하드코딩하지 않고 `platform.machine()`으로 실행 시점에 판별한다
+(`HOST_ARCH`, `deployctl:52-53`). 이 서버가 바뀌어도 도구는 따라가지만, 위 규칙 문구는
+사람이 읽는 것이라 자동으로 안 바뀐다.
 
 ---
 
 ## 4. 데이터베이스 — 공유 Postgres
 
-> **규칙 4-1.** Postgres는 **`postgres:17-alpine` 인스턴스 1개**만 띄우고 **전 사이트가 공유**한다.
-> 사이트마다 별도 Postgres 컨테이너를 만들지 않는다.
+> **규칙 4-1.** Postgres는 **`postgres:17-alpine` 인스턴스 1개**만 띄우고 **전 사이트가
+> 공유**한다. 사이트마다 별도 Postgres 컨테이너를 만들지 않는다.
 
 > **규칙 4-2.** 사이트마다 **전용 데이터베이스 + 전용 유저**를 만든다.
 > 각 유저는 **자기 DB에만** 접근 권한을 가진다.
@@ -72,18 +75,19 @@ docker buildx imagetools inspect <image>                            # 원격 이
 
 ### 4-1. 공유 인스턴스 정의
 
-`~/srv/postgres/docker-compose.yml`:
+`~/srv/postgres/compose.yaml`:
 
 ```yaml
 services:
   postgres:
     image: postgres:17-alpine
+    container_name: postgres
     restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    # ports 를 열지 않는다 — 외부/호스트 노출 금지, 아래 공유 네트워크로만 접근
+    # ports 를 열지 않는다 — 외부/호스트 노출 금지, dbnet 네트워크로만 접근
     networks: [dbnet]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -98,9 +102,19 @@ volumes:
   pgdata:
 
 networks:
+  # 이미 존재하는 네트워크를 그대로 쓴다 (사이트 compose들도 동일하게 external 로 참여).
   dbnet:
-    name: dbnet
+    external: true
 ```
+
+- `container_name: postgres`를 **반드시 명시한다.** `deployctl`이 `docker exec -i postgres
+  ...`로 이 이름을 그대로 참조한다(`PG_CONTAINER = "postgres"`, 하드코딩). compose
+  프로젝트명 추정에 맡기면 이름이 달라져 깨진다.
+- `dbnet` 네트워크는 **이 compose가 만들지 않는다** — 이미 떠 있는 브리지 네트워크를
+  `external: true`로 참여만 한다(사이트 compose들과 동일한 패턴). 처음부터 없다면
+  `docker network create dbnet`으로 한 번 만들어 둔다.
+- 슈퍼유저는 `postgres`다. `POSTGRES_USER`를 커스텀 값으로 주면 공식 이미지가 `postgres`
+  롤 자체를 안 만드므로 **절대 `POSTGRES_USER`를 지정하지 않는다.**
 
 각 사이트의 compose는 이 네트워크에 **외부 네트워크로 참여**한다:
 
@@ -131,7 +145,7 @@ GRANT CONNECT ON DATABASE foo TO foo_user;
 > CONNECT 권한**을 준다. 이걸 회수하지 않으면 `foo_user`가 `bar` DB에 접속할 수 있다.
 > **새 DB를 만들 때마다 반드시 실행한다.**
 
-**기본 DB에 대한 1회성 조치 (이미 적용됨, 2026-08-19)**
+**기본 DB에 대한 1회성 조치 (적용됨, 2026-09-06)**
 
 `postgres`와 `template1`도 PUBLIC에 CONNECT가 열려 있어 사이트 유저가 접속 가능했다. 회수 완료:
 
@@ -150,9 +164,9 @@ Postgres 구조상 막기 어렵다. DB명에 민감한 정보를 넣지 말 것
 검증 (반드시 수행):
 ```bash
 # 자기 DB 접속 → 성공해야 함
-docker compose exec postgres psql -U foo_user -d foo -c 'SELECT current_database();'
+docker exec -i postgres psql -U foo_user -d foo -c 'SELECT current_database();'
 # 남의 DB 접속 → 반드시 실패해야 함
-docker compose exec postgres psql -U foo_user -d bar -c 'SELECT 1;'
+docker exec -i postgres psql -U foo_user -d bar -c 'SELECT 1;'
 ```
 
 ### 4-3. 커넥션 풀 제한
@@ -172,7 +186,8 @@ Postgres 쪽 상한도 함께 관리한다:
 ```
 max_connections >= (사이트 수 x 5) + 10   # +10은 관리/백업용 여유분
 ```
-사이트를 추가할 때 이 값을 재확인하고, 부족하면 `max_connections`를 올린 뒤 재시작한다.
+기본값은 100이라 사이트 몇 개로는 여유롭다. 사이트를 추가할 때 이 값을 재확인하고,
+부족하면 `max_connections`를 올린 뒤 재시작한다.
 
 ### 4-4. 접속 문자열
 
@@ -204,25 +219,62 @@ ports:
 
 ## 6. Caddy
 
-> **규칙 6-1.** Caddy는 반드시 **`sudo`로 기동**한다.
+Caddy는 `systemd`가 관리하는 **시스템 서비스**(`caddy.service`, `enabled`)다. 부팅 시
+로그인 없이 자동 기동되며, macOS의 LaunchAgent/LaunchDaemon 구분 같은 건 없다 — 이미 가장
+간단한 형태다.
 
 ```bash
-sudo brew services start caddy      # O — LaunchDaemon(root), 로그인 없이 부팅 시 기동
-brew services start caddy           # X — LaunchAgent(user), 로그인해야 뜬다
+sudo systemctl start|stop|restart|status caddy   # systemctl 은 deploy에게 NOPASSWD sudo 허용됨
 ```
 
-**이유는 포트 권한이 아니다.** macOS는 리눅스와 달리 1024 미만 포트를 root로 제한하지 않아
-일반 사용자도 80/443을 바인딩할 수 있다 (79·123·1023 실측 확인, 2026-08-20).
-`sudo`가 필요한 진짜 이유는 **LaunchDaemon으로 등록되어 로그인 세션 없이 부팅 직후 뜨기 때문**이다.
-colima·runner가 로그인을 기다리는 동안에도 Caddy는 살아 있어야 한다.
+- 설정 파일(실제): **`/etc/caddy/Caddyfile`**
+- 사이트별 설정: `/etc/caddy/caddy-sites/*.caddy` (메인 파일이 `import`)
+- 로그: `/var/log/caddy/` (caddy 유저 소유)
+- 데몬 실행 계정: 시스템 유저 `caddy` (deploy가 아니다)
 
-- 관리 API(`127.0.0.1:2019`)는 일반 사용자에게 열려 있어 **reload에는 sudo가 필요 없다.**
-  `caddy reload --config ...`로 사이트 추가·삭제를 무인 자동화할 수 있다.
+### 6-1. `/opt/homebrew` 경로 셔밈 — 왜 리눅스에 이 경로가 있는가
 
-- 설정 파일: `/opt/homebrew/etc/Caddyfile`
-- 인증서/상태: `/opt/homebrew/var/lib/caddy` (Homebrew plist가 `HOME`을 덮어씀 — 백업 대상)
-- 로그: `/opt/homebrew/var/log/caddy.log`
-- 사이트 추가 시 Caddyfile에 블록을 추가하고 `sudo brew services reload caddy`로 **무중단 반영**한다.
+> **규칙 6-1.** `/opt/homebrew` 아래의 심볼릭 링크를 지우거나 옮기지 않는다.
+> `deployctl`의 Caddy 자동화 전체가 이걸 통해서만 작동한다.
+
+`deployctl`은 macOS(Homebrew) 전제로 짜여 있어 `CADDYFILE`·`CADDY_SITES` 상수가
+`/opt/homebrew/etc/Caddyfile`, `/opt/homebrew/etc/caddy-sites`로 **하드코딩**돼 있다.
+이 경로를 실제 위치로 옮기는 대신(§1 결정: 서버가 도구에 맞춘다), 그 자리에 진짜 설정을
+가리키는 심볼릭 링크를 심어서 해결했다(2026-09-06):
+
+```
+/opt/homebrew/                 deploy:deploy 755 (deploy 소유 — 그 아래는 sudo 없이 자유)
+├── etc → /etc/caddy           (디렉터리 심볼릭 링크: 그 밑의 파일 쓰기는 실제로 /etc/caddy 안에 반영됨)
+└── var/log/caddy → /var/log/caddy
+```
+
+이 심볼릭 링크 덕분에 `deployctl`이 `/opt/homebrew/etc/Caddyfile`에 쓰면 실제로는
+`/etc/caddy/Caddyfile`이 바뀐다. `caddy validate --config /opt/homebrew/etc/Caddyfile`도
+같은 이유로 동작한다.
+
+### 6-2. 권한 — sudo 없이 쓰기
+
+> **규칙 6-2.** `deployctl`은 Caddy 설정을 **sudo 없이** 쓴다. 그러려면 `/etc/caddy`와
+> `Caddyfile`이 `deploy`가 쓸 수 있는 그룹 소유여야 한다.
+
+`/etc/caddy`(디렉터리, `deployctl`이 여기 임시파일을 만들어 원자적 교체함)와
+`Caddyfile`을 `root:caddy`로, `deploy`를 `caddy` 그룹에 편입했다(2026-09-06):
+
+```bash
+sudo usermod -aG caddy deploy
+sudo install -d -o root -g caddy -m 775 /etc/caddy
+sudo install -d -o root -g caddy -m 775 /etc/caddy/caddy-sites
+sudo install -o root -g caddy -m 664 <Caddyfile 사본> /etc/caddy/Caddyfile   # 내용 보존, 권한만 교체
+```
+
+- **이 권한은 되돌아갈 수 있다.** Caddyfile을 `root`로 직접 편집(예: 대화형 `sudo vi`)하면
+  `install`/`vi`가 기본 권한(보통 `root:root 644`)으로 다시 써버려 `deployctl`의 쓰기가
+  막힌다. 사람이 직접 고쳤다면 **위 `install` 명령으로 그룹·권한을 다시 맞춘다.**
+- 볼륨을 밀거나 서버를 재설치하면 이 두 조치(usermod, install) 모두 다시 필요하다.
+- 관리 API(`127.0.0.1:2019`)는 `deploy`에게 열려 있어 **reload에는 애초에 권한 문제가
+  없다.** `caddy reload --config ...`로 사이트 추가·삭제를 무인 자동화할 수 있다.
+- 사이트 추가 시 Caddyfile에 블록을 추가하고 `caddy reload`(관리 API)로 **무중단
+  반영**한다. `sudo`는 필요 없다.
 - 변경 전 `caddy validate --config /opt/homebrew/etc/Caddyfile`로 검증한다.
 - 인증서 실험 시에는 `acme_ca` 스테이징 URL을 쓴다 (Let's Encrypt rate limit 회피).
 
@@ -230,7 +282,7 @@ colima·runner가 로그인을 기다리는 동안에도 Caddy는 살아 있어�
 
 ## 7. 디렉터리 구조
 
-이 맥에는 코드가 놓이는 위치가 셋이며, **역할이 다르므로 섞지 않는다.**
+이 서버에는 코드가 놓이는 위치가 셋이며, **역할이 다르므로 섞지 않는다.**
 
 | 경로 | 역할 | 소스 관리 | 편집 |
 |---|---|---|---|
@@ -249,8 +301,11 @@ colima·runner가 로그인을 기다리는 동안에도 Caddy는 살아 있어�
 ```
 
 - 새 프로젝트는 `git clone`으로 이 폴더 아래에 받는다.
-- `deployctl`도 여기서 고친다. `/opt/homebrew/bin/deployctl`이 이 파일을 가리키는 심볼릭 링크라
-  저장하는 즉시 반영된다. 배포 워크플로는 경로 대신 명령 이름으로 부른다.
+- `deployctl`도 여기서 고친다. `/usr/local/bin/deployctl`이 이 파일을 실행하는 한 줄짜리
+  래퍼 스크립트라(`exec ~/workspaces/initial-settings/deployctl "$@"`) 저장하는 즉시
+  반영된다. (macOS의 Homebrew였다면 심볼릭 링크로 됐겠지만, `/usr/local/bin`은 `root`
+  소유라 `deploy`가 직접 심볼릭 링크를 못 걸어 래퍼로 대신했다 — 효과는 동일하다.)
+  배포 워크플로는 경로 대신 명령 이름(`deployctl`)으로 부른다.
 - `~/srv/`나 `~/actions-runner/_work/`의 파일을 직접 수정하지 않는다.
   전자는 배포 설정 전용이고, 후자는 배포 때마다 덮어써진다.
 
@@ -259,10 +314,10 @@ colima·runner가 로그인을 기다리는 동안에도 Caddy는 살아 있어�
 ```
 ~/srv/
 ├── postgres/            # 공유 DB 인스턴스
-│   ├── docker-compose.yml
+│   ├── compose.yaml
 │   └── .env
 └── <사이트명>/
-    ├── docker-compose.yml
+    ├── compose.yaml (또는 app.json이 가리키는 파일)
     └── .env             # DB 접속 정보 등, git 미포함, chmod 600
 ```
 
@@ -276,37 +331,43 @@ colima·runner가 로그인을 기다리는 동안에도 Caddy는 살아 있어�
 ## 8. 배포 (GitHub Actions self-hosted runner)
 
 > **규칙 8-1.** self-hosted runner는 **private 저장소에만** 연결한다.
-> public 저장소에 붙이면 임의의 PR 코드가 이 맥에서 실행된다.
+> public 저장소에 붙이면 임의의 PR 코드가 이 서버에서 실행된다.
 
 > **규칙 8-2.** 러너는 **저장소마다 하나씩** 붙인다. `deployctl runner <사이트>`로 등록한다.
 
 `tinynoroo`는 **Organization이 아니라 개인(User) 계정**이라 조직 단위 러너를 쓸 수 없다.
 GitHub의 조직 단위 러너는 Organization/Enterprise 계정에만 있다. 따라서 저장소가 늘 때마다
-러너 인스턴스가 하나씩 늘어난다 (실측 상주 메모리 러너당 약 134 MB).
-사이트가 많아져 부담이 되면 Organization을 만들어 저장소를 옮기는 쪽이 답이다.
+러너 인스턴스가 하나씩 늘어난다. 사이트가 많아져 부담이 되면 Organization을 만들어 저장소를
+옮기는 쪽이 답이다.
 
 - 러너는 **`~/actions-runner/<사이트>/`** 아래로 모은다. 홈에 흩어 놓지 않는다.
   ```
   ~/actions-runner/
-  ├── actions-runner-osx-arm64-<버전>.tar.gz   # 공용 배포본
-  ├── king-maker/
-  └── myapp/
+  ├── actions-runner-linux-x64-<버전>.tar.gz   # 공용 배포본
+  └── <사이트명>/
   ```
-- 러너 이름은 `mac-<사이트>`, 라벨은 사이트명이다. 예외를 두지 않는다.
-- 배포본 tarball은 위 공용 자리의 것을 재사용하고, 없으면 최신을 내려받는다.
-- 디렉터리를 옮기면 LaunchAgent는 따라오지 않는다. `deployctl runner <사이트>`가
+- 러너 이름은 `linux-<사이트>`, 라벨은 사이트명이다. 예외를 두지 않는다.
+- 배포본 tarball은 위 공용 자리의 것을 재사용하고, 없으면 이 호스트(`linux-x64`)용 최신을
+  내려받는다.
+- 서비스는 `systemd`(시스템 유닛, `/etc/systemd/system/`)로 등록된다. **리눅스의
+  `svc.sh install/start/stop/uninstall`은 내부에서 `systemctl`을 직접 부르므로 반드시
+  `sudo`로 실행돼야 한다** (macOS는 사용자 LaunchAgent라 sudo가 필요 없었지만, 리눅스는
+  다르다). `deployctl`은 `systemctl`이 NOPASSWD sudo 목록에 있어 이 호출을 무인으로 한다
+  (`sudo_prefix()`, `deployctl:607`).
+- 디렉터리를 옮기면 서비스 등록은 따라오지 않는다. `deployctl runner <사이트>`가
   등록이 살아 있는지 보고 서비스만 다시 건다.
 - 워크플로의 `runs-on`에 **사이트명 라벨**을 넣어 러너를 특정한다.
   ```yaml
-  runs-on: [self-hosted, macOS, ARM64, <사이트>]
+  runs-on: [self-hosted, Linux, X64, <사이트>]
   ```
   라벨이 겹치는 러너가 여러 대면 아무 데서나 돌 수 있다. 쓰지 않는 러너는 반드시 해제한다.
-- 러너 `.env`에 PATH를 명시한다. LaunchAgent는 로그인 셸 환경을 상속하지 않아
+- 러너 `.env`에 PATH를 명시한다. 서비스로 뜬 러너는 로그인 셸 환경을 상속하지 않아
   이게 없으면 `docker: command not found`가 난다.
   ```
-  PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+  PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
   ```
-- 배포 워크플로에는 **docker 데몬 대기 단계**를 넣는다. 재부팅 직후 runner가 colima보다 먼저 뜰 수 있다.
+- 배포 워크플로에는 **docker 데몬 대기 단계**를 넣는다. 재부팅 직후 runner가 docker보다
+  먼저 뜰 수 있다.
   ```yaml
   - run: for i in $(seq 30); do docker info >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1
   ```
@@ -316,15 +377,29 @@ GitHub의 조직 단위 러너는 Organization/Enterprise 계정에만 있다. �
   마이그레이션(컬럼 추가 등)은 구 이미지가 견디지만, 파괴적 변경은 롤백해도 깨진다.
   첫 배포는 되돌릴 이미지가 없으므로 롤백하지 않고 실패로 끝난다. 끄려면 `--no-rollback`.
 
+**알려진 부채 (2026-09-07 기준)**: 현재 유일하게 운영 중인 사이트 `myapp`
+(`corps.example.com`, 포트 9030)은 위 규칙이 자리잡기 전에 손으로 설정된 것이라 아직
+따르지 않는다 — 러너가 `~/actions-runner/myapp/`이 아니라
+`~/actions-runner/` 바로 아래에 있고, 이름도 `linux-myapp`이 아니라
+`deploy-myapp`이며, 자체 `.github/workflows/deploy.yml`로
+(`deployctl`을 거치지 않고) `sudo docker compose`로 직접 배포한다. `~/srv/`에도
+이 사이트의 `app.json`이 없어 `deployctl`의 장부에 잡히지 않는다. 손대려면 먼저
+사용자에게 확인받는다 — 지금은 정상 동작 중인 운영 사이트다.
+
 ---
 
 ## 9. 자동 시작 / 재부팅
 
-colima(`brew services`)와 runner(`svc.sh`)는 둘 다 **사용자 LaunchAgent**라 로그인 세션에서만 로드된다.
-재부팅 후 무인 복구를 하려면 **자동 로그인이 켜져 있어야 한다.**
-Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
+Docker(`docker.service`)·Caddy(`caddy.service`)·러너(`actions.runner.*.service`) 모두
+**시스템 단위 `systemd` 서비스**(`enabled`)다. macOS의 사용자 LaunchAgent와 달리 **로그인
+세션이나 자동 로그인 없이도 부팅 직후 그대로 뜬다** — 이 부분은 리눅스가 원래 더 단순하다.
 
-- colima를 `sudo`로 띄우지 않는다. VM 상태와 이미지가 root 홈으로 분리되어 사용자 계정의 docker CLI와 어긋난다.
+```bash
+systemctl is-enabled docker caddy   # 둘 다 enabled 여야 함
+```
+
+- Docker를 `sudo`로 띄우거나 데이터 디렉터리를 손으로 옮기지 않는다. 표준 `apt` 설치
+  그대로 `/var/lib/docker`를 쓴다.
 
 ---
 
@@ -340,7 +415,7 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
    deployctl deploy   <사이트>                        # 기동 + Caddy 등록 + HTTPS 확인
    ```
    손으로 할 때만 아래를 직접 확인한다.
-   - [ ] 이미지 arm64 확인
+   - [ ] 이미지 아키텍처 확인 (이 서버는 amd64)
    - [ ] DB + 유저 생성, `REVOKE ALL ON DATABASE ... FROM PUBLIC` 수행
    - [ ] 타 사이트 DB 접근 차단 검증 (§4-2)
    - [ ] 커넥션 풀 설정, `max_connections` 여유 확인
@@ -353,19 +428,22 @@ Caddy만 LaunchDaemon(root)이라 로그인과 무관하게 뜬다.
 
 ## 11. deployctl — 배포 도구
 
-`deployctl` (PATH에 있음 — `/opt/homebrew/bin/deployctl` → `~/workspaces/initial-settings/deployctl` 심볼릭 링크).
-위 규칙을 사람이 외우는 대신 기계가 검사·수행한다.
-표준 라이브러리만 쓰며 **sudo가 필요 없다** (Caddy reload는 관리 API로 한다).
+`deployctl` (PATH에 있음 — `/usr/local/bin/deployctl`, `~/workspaces/initial-settings/deployctl`을
+그대로 실행하는 한 줄 래퍼. §7-1 참고).
+위 규칙을 사람이 외우는 대신 기계가 검사·수행한다. 표준 라이브러리만 쓴다.
+Caddy·DB 작업엔 **sudo가 필요 없다**(Caddy reload는 관리 API로, 파일 쓰기 권한은 §6-2의
+그룹 소유로 미리 확보해 뒀다). **러너 서비스 등록만 리눅스에서 예외적으로 sudo를 쓴다**
+(§8, `systemctl`이 NOPASSWD라 무인으로 된다).
 
 | 명령 | 하는 일 |
 |---|---|
 | `init` | 매니페스트 생성, 포트 자동 배정(9000–9099), `~/workspaces/<사이트>`로 clone, 전용 DB·유저 생성 + 격리 검증, `.env`에 `DATABASE_URL` 기록(600) |
-| `validate` | 사이트명·포트·도메인 중복, 커넥션 여유, DNS, arm64, `127.0.0.1` 바인딩, **게시 포트 == `app.json` 포트**, 전용 Postgres 금지, `dbnet` 참여, **빌드 정의 없는 이미지의 존재 여부** |
+| `validate` | 사이트명·포트·도메인 중복, 커넥션 여유, DNS, 이미지 아키텍처(호스트와 일치), `127.0.0.1` 바인딩, **게시 포트 == `app.json` 포트**, 전용 Postgres 금지, `dbnet` 참여, **빌드 정의 없는 이미지의 존재 여부** |
 | `deploy` | 배포 대상(커밋·브랜치·미커밋) 표시 → 검사 → 빌드 → 기동 → Caddy 등록·reload → HTTPS 폴링 → 실패 시 롤백 |
 | `status` | 컨테이너·Caddy 등록·HTTPS·커넥션 현황 |
 | `scaffold` | **없는** `Dockerfile`·compose 생성 (Dockerfile은 `claude -p` 초안 → `docker build` 검증, 실패 시 오류 되먹여 재시도) |
 | `workflow` | `.github/workflows/deploy.yml` 생성 (docker 대기 → checkout → deploy, `runs-on`에 사이트 라벨). **이미 있으면 `--force` 없이는 덮어쓰지 않는다** |
-| `runner` | 저장소 전용 Actions 러너 등록 (private 확인 → 배포본 전개 → 토큰 발급 → LaunchAgent 기동), `--remove`로 해제 |
+| `runner` | 저장소 전용 Actions 러너 등록 (private 확인 → 배포본 전개 → 토큰 발급 → systemd 서비스 기동), `--remove`로 해제 |
 | `remove` | 컨테이너 정리 + Caddy 사이트 해제 (DB와 매니페스트는 남긴다) |
 
 `init`은 **사이트명과 `--domain`이 둘 다 주어졌을 때만** 조용히 실행된다.
@@ -427,9 +505,12 @@ github 저장소는 `gh repo clone`으로 받는다 — 계정에 설정된 프�
 
 ### 11-2. Caddy 파일 구조
 
+`deployctl` 코드가 보는 경로는 `/opt/homebrew/etc/...`이지만, §6-1의 심볼릭 링크를 통해
+실제로는 이렇게 반영된다:
+
 ```
-/opt/homebrew/etc/Caddyfile          # 전역 설정 + import 한 줄만
-/opt/homebrew/etc/caddy-sites/       # 도메인당 파일 하나 (deployctl 생성)
+/opt/homebrew/etc/Caddyfile          # → /etc/caddy/Caddyfile (전역 설정 + import 한 줄만)
+/opt/homebrew/etc/caddy-sites/       # → /etc/caddy/caddy-sites/ (도메인당 파일 하나, deployctl 생성)
 ```
 
 메인 Caddyfile에 사이트 블록을 직접 적지 않는다. 같은 도메인이 양쪽에 있으면 Caddy가
@@ -437,17 +518,16 @@ github 저장소는 `gh repo clone`으로 받는다 — 계정에 설정된 프�
 
 ### 11-3. 포트
 
-호스트 Caddy가 `127.0.0.1:<포트>`로 프록시하므로 **사이트마다 포트가 하나씩 필요**하다.
-(traefik과 달리 컨테이너에 직접 라우팅할 수 없다. colima VM 네트워크가 호스트에서 닿지 않는다.)
-`init`이 9000번대에서 비어 있는 포트를 배정하고, `validate`가 중복을 막는다. 손으로 정하지 않는다.
+호스트 Caddy가 `127.0.0.1:<포트>`로 프록시하므로 **사이트마다 포트가 하나씩 필요**하다
+(traefik과 달리 컨테이너에 직접 라우팅하지 않는다). `init`이 9000번대에서 비어 있는
+포트를 배정하고, `validate`가 중복을 막는다. 손으로 정하지 않는다.
 
 ### 11-4. 스캐폴딩 — 없는 것만 만든다
 
 > **규칙 11-4.** 이미 있는 `Dockerfile`·compose는 **덮어쓰지 않는다.** `--force`를 줄 때만 예외.
 
-사람이 쓴 파일에는 생성기가 모르는 판단이 들어 있다 (king-maker compose의 `sessiond`
-빌드 제외 주석, `x-app-env` 앵커, 보안 경계). 규칙 위반이 있어도 `validate`가 **짚어만 주고**
-고치지 않는다.
+사람이 쓴 파일에는 생성기가 모르는 판단이 들어 있다. 규칙 위반이 있어도 `validate`가
+**짚어만 주고** 고치지 않는다.
 
 | 상태 | 하는 일 |
 |---|---|
@@ -459,7 +539,8 @@ github 저장소는 `gh repo clone`으로 받는다 — 계정에 설정된 프�
 **Dockerfile은 `claude -p`로 만들고 `docker build`로 검증한다.** 빌드가 실패하면 오류를
 프롬프트에 되먹여 다시 만든다 (기본 3회). 통과한 초안만 파일로 남는다. Claude에는
 `Read,Glob,Grep`만 준다 — 파일은 deployctl이 쓴다. 프롬프트에 규칙을 박는다:
-arm64 멀티아치 베이스(규칙 3-1), `--platform` 금지, non-root 실행, 시크릿 미포함, `EXPOSE` 명시.
+호스트 아키텍처(이 서버는 amd64)에 맞는 멀티아치 베이스(규칙 3-1), `--platform` 금지,
+non-root 실행, 시크릿 미포함, `EXPOSE` 명시.
 
 **배포 경로에는 넣지 않는다.** 러너 워크플로는 `claude` 없이 돌아야 하고, 배포는 재현
 가능해야 한다. 비대화형에서는 `--scaffold`를 명시할 때만 동작한다.
