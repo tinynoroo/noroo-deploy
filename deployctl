@@ -1447,12 +1447,19 @@ def run_undo(undo):
 # ── 명령 ────────────────────────────────────────────────────────────────
 
 def cmd_init(args):
-    # 이름과 도메인이 둘 다 오면 예전처럼 조용히 돈다. 하나라도 빠지면 물어본다.
+    # 이름과 도메인이 둘 다 오면 물어보지 않고 돈다. 하나라도 빠지면 물어본다.
     if args.name is None or args.domain is None:
         if not sys.stdin.isatty():
             raise DeployError("대화형으로 물을 수 없는 환경입니다. "
                               "<사이트명> 과 --domain 을 인자로 주세요.")
         prompt_init(args)
+    else:
+        # 비대화형이라 프롬프트를 안 거치지만, 안 준 항목은 대화형 기본값(예)과
+        # 똑같이 처리한다 — 명시적으로 끄려면 --no-runner / --no-deploy 를 쓴다.
+        if args.runner is None:
+            args.runner = bool(args.repo)
+        if args.deploy is None:
+            args.deploy = True
     args.repo = args.repo or ""
     args.compose = args.compose or "source:compose.yaml"
     args.health_path = args.health_path or "/"
@@ -1814,9 +1821,14 @@ def main():
     p.add_argument("--no-clone", action="store_true",
                    help="저장소를 ~/workspaces 로 받아 오지 않는다")
     p.add_argument("--runner", action="store_true", default=None,
-                   help="이 저장소 전용 Actions 러너를 등록한다")
+                   help="이 저장소 전용 Actions 러너를 등록한다 "
+                        "(비대화형 기본값: 저장소가 있으면 예)")
+    p.add_argument("--no-runner", dest="runner", action="store_false", default=None,
+                   help="러너를 등록하지 않는다")
     p.add_argument("--deploy", action="store_true", default=None,
-                   help="등록이 끝나면 바로 배포한다")
+                   help="등록이 끝나면 바로 배포한다 (비대화형 기본값: 예)")
+    p.add_argument("--no-deploy", dest="deploy", action="store_false", default=None,
+                   help="등록 후 바로 배포하지 않는다")
     p.add_argument("--scaffold", action="store_true", default=None,
                    help="없는 Dockerfile·compose 를 claude 로 만든다")
     p.add_argument("--no-push", dest="push", action="store_false", default=None,
