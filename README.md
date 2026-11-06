@@ -1,5 +1,7 @@
 # noroo-deploy
 
+**English** | [한국어](README.ko.md)
+
 `deployctl`, a deploy tool for hosting many sites on a single server, and the rulebook used to run that server.
 
 Pick a repository and one command takes it from port assignment to a verified HTTPS response. If anything fails along the way, only what that run created is rolled back.
